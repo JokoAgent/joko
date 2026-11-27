@@ -353,7 +353,7 @@ export function createMobileAutomationDraft(
     scriptDispatchSessions: schedule?.script?.dispatchSessions ?? false,
     ...(schedule?.executionMode === "script" ? {} : schedule?.model !== undefined
       ? { model: { ...schedule.model, ...(schedule.model.effortId === undefined ? {} : { effortId: schedule.model.effortId }) } }
-      : defaultModel === undefined || savedBoundTaskDefault(schedule) ? {} : { model: defaultModel }),
+      : defaultModel === undefined || schedule?.taskModelGroupId !== undefined || savedBoundTaskDefault(schedule) ? {} : { model: defaultModel }),
     permissionMode: schedule?.permissionMode ?? (defaultPermission && permissions.includes(defaultPermission)
       ? defaultPermission : permissions[0] ?? "ask"),
     planMode: schedule?.executionMode === "script" ? false : schedule?.planMode ?? (execution?.canSetPlanMode && backendSettings.length === 1
@@ -479,7 +479,11 @@ export function buildMobileAutomationScheduleInput(
     throw new Error("A fresh Automation cannot retain a task binding.");
   } else if (draft.sessionMode === "persistent" && draft.sessionId !== "") {
     boundSession = unique(owner.sessions, (candidate) => candidate.sessionId === draft.sessionId);
-    if (!boundSession || boundSession.targetId !== target.targetId || boundSession.backendId !== target.backendId) {
+    const sameGeneratedTask = existing?.sessionMode === "persistent" && existing.sessionId === draft.sessionId
+      && existing.targetId === target.targetId && existing.backendId === target.backendId
+      && target.location?.kind.case === "serviceNode" && boundSession?.location?.kind.case === "serviceNode"
+      && boundSession.automationOrigin?.scheduleId === existing.scheduleId && positiveRevision(boundSession.version?.revision);
+    if (!boundSession || boundSession.targetId !== target.targetId || (boundSession.backendId !== target.backendId && !sameGeneratedTask)) {
       throw new Error("The persistent Automation task binding is no longer current.");
     }
   }
@@ -590,7 +594,7 @@ export function buildMobileAutomationScheduleInput(
       } }),
       permissionMode,
       planMode: !scriptMode && draft.planMode,
-      ...(!scriptMode && model && draft.taskModelGroupId ? { taskModelGroupId: draft.taskModelGroupId } : {}),
+      ...(!scriptMode && draft.taskModelGroupId ? { taskModelGroupId: draft.taskModelGroupId } : {}),
       extraDirectoryIds: scriptMode ? [] : extraDirectoryIds,
       executionMode: scriptMode ? ScheduleExecutionMode.SCRIPT : ScheduleExecutionMode.AGENT,
       ...(scriptMode ? { script: {

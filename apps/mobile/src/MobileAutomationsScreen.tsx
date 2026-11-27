@@ -446,6 +446,7 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, local
       ...current,
       targetId: target.targetId,
       backendId: target.backendId,
+      taskModelGroupId: undefined,
       sessionMode: "fresh",
       sessionId: "",
       model: undefined,
@@ -461,6 +462,7 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, local
     setDraft((current) => mode === "agent" ? { ...current, executionMode: mode } : {
       ...current,
       executionMode: mode,
+      taskModelGroupId: undefined,
       sessionMode: current.sessionMode === "bound" ? "bound" : "fresh",
       sessionId: current.sessionMode === "bound" ? current.sessionId : "",
       model: undefined,
@@ -495,11 +497,15 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, local
     }
   };
   const chooseModel = (providerId?: string, modelId?: string): void => {
-    if (!providerId || !modelId) { set("model", undefined); return; }
+    if (!providerId || !modelId) {
+      setDraft(current => ({ ...current, taskModelGroupId: undefined, model: undefined }));
+      return;
+    }
     const route = models.find((candidate) => candidate.providerId === providerId && candidate.modelId === modelId);
     if (!route) return;
     const effortId = route.efforts.find((effort) => effort.default)?.id;
-    set("model", { providerId, modelId, ...(effortId === undefined ? {} : { effortId }), fastMode: false });
+    setDraft(current => ({ ...current, taskModelGroupId: undefined,
+      model: { providerId, modelId, ...(effortId === undefined ? {} : { effortId }), fastMode: false } }));
   };
   const loadWorktree = async (): Promise<void> => {
     const sequence = ++worktreeLoadSequence.current;
@@ -656,11 +662,12 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, local
         <EditorInput label={mobileMessage(locale, "automation.editor.scheduledInput")} value={draft.inputText} colors={colors} editable={editable} multiline
           onChange={(value) => set("inputText", value)} />
         <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "automation.editor.modelSnapshot")}</Text>
+        {draft.taskModelGroupId && <Text style={[styles.caption, { color: colors.ink }]}>{mobileMessage(locale, "models.group")} · {draft.taskModelGroupId}</Text>}
         <View style={styles.optionRow}>
-          <Choice label={mobileMessage(locale, "automation.editor.backendDefault")} selected={draft.model === undefined} colors={colors}
+          <Choice label={mobileMessage(locale, "automation.editor.backendDefault")} selected={draft.taskModelGroupId === undefined && draft.model === undefined} colors={colors}
             disabled={!editable || execution?.canSelectModel !== true} onPress={() => chooseModel()} />
           {models.map((model) => <Choice key={model.key} label={`${model.providerName} · ${model.displayName}`}
-            selected={draft.model?.providerId === model.providerId && draft.model.modelId === model.modelId}
+            selected={draft.taskModelGroupId === undefined && draft.model?.providerId === model.providerId && draft.model.modelId === model.modelId}
             colors={colors} disabled={!editable || execution?.canSelectModel !== true}
             onPress={() => chooseModel(model.providerId, model.modelId)} />)}
           {draft.model !== undefined && selectedModel === undefined && <Choice

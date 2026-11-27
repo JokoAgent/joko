@@ -10,6 +10,8 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["models.group", "Model group", "模型组", "模型組", "モデルグループ", "모델 그룹"],
+  ["models.exact", "Use a specific model", "使用具体模型", "使用指定模型", "個別のモデルを使用", "특정 모델 사용"],
   ["settings.wallpaper", "Wallpaper", "壁纸", "桌布", "壁紙", "배경 화면"],
   ["settings.wallpaperPick", "Choose photo or video", "选择照片或视频", "選擇照片或影片", "写真または動画を選択", "사진 또는 동영상 선택"],
   ["settings.wallpaperStatic", "Static", "静态", "靜態", "静止画", "정지 화면"],

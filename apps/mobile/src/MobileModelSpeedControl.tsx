@@ -2,6 +2,15 @@ import { Pressable, StyleSheet, Switch, Text, View } from "react-native";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 
+export function mobileModelSpeedChoices(locale: MobileSupportedLocale, supportsFast: boolean, supportsUltrafast = false) {
+  const zh = locale === "zh-CN";
+  return [
+    { value: false, label: zh ? "标准" : "Standard", enabled: true },
+    { value: true, label: zh ? "快速" : "Fast", enabled: supportsFast },
+    { value: "ultrafast", label: zh ? "极速" : "Ultrafast", enabled: supportsUltrafast }
+  ] as const;
+}
+
 export function MobileModelSpeedControl({ value, supportsFast, supportsUltrafast, disabled = false, colors, locale, onChange }: {
   readonly value: boolean | "ultrafast";
   readonly supportsFast: boolean;
@@ -12,11 +21,7 @@ export function MobileModelSpeedControl({ value, supportsFast, supportsUltrafast
   readonly onChange: (value: boolean | "ultrafast") => void;
 }) {
   const zh = locale === "zh-CN";
-  const choices: readonly { readonly value: boolean | "ultrafast"; readonly label: string; readonly enabled: boolean }[] = [
-    { value: false, label: zh ? "标准" : "Standard", enabled: true },
-    { value: true, label: zh ? "快速" : "Fast", enabled: supportsFast },
-    { value: "ultrafast", label: zh ? "极速" : "Ultrafast", enabled: supportsUltrafast === true }
-  ];
+  const choices = mobileModelSpeedChoices(locale, supportsFast, supportsUltrafast);
   if (supportsUltrafast || value === "ultrafast") return <View style={styles.stack}>
     <Text style={{ color: colors.ink }}>{zh ? "速度" : "Speed"}</Text>
     <View style={styles.choices}>{choices.filter(choice => choice.enabled || choice.value === value).map(choice => <Pressable key={String(choice.value)}

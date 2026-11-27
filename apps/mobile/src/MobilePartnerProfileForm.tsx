@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { MobileModelSpeedControl } from "./MobileModelSpeedControl";
+import { MobileTaskModelGroupPicker } from "./MobileTaskModelGroupPicker";
 import { partnerTaskModelMessages } from "@joko/contracts";
 import { Pressable, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { MobilePartnerPhotoPicker } from "./MobilePartnerPhotoPicker";
@@ -71,6 +72,8 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
                 && candidate.providerId === route.providerId && candidate.modelId === route.modelId);
               return <View key={index} style={[styles.section, { borderColor: colors.border }]}>
                 <Text style={[styles.label, { color: colors.muted }]}>{mobileMessage(locale, "partnerProfile.model", { index: index + 1 })}</Text>
+                <MobileTaskModelGroupPicker catalog={snapshot.options.modelGroups} value={route.taskModelGroupId} colors={colors} locale={locale}
+                  disabled={!capabilitiesEditable} onSelect={choice => updateRoute(index, { ...route, taskModelGroupId: choice?.groupId })} />
                 {action(model ? modelLabel(model) : `${route.modelId} · ${route.providerId}`,
                   () => setModelIndex(modelIndex === index ? undefined : index), !capabilitiesEditable)}
                 {modelIndex === index && snapshot.models.map((choice) => {
@@ -125,6 +128,8 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
                   change(taskModelOverride === undefined ? rest : { ...rest, taskModelOverride });
                 };
                 return <>
+                  <MobileTaskModelGroupPicker catalog={snapshot.options.modelGroups} value={route.taskModelGroupId} colors={colors} locale={locale}
+                    disabled={!editable} onSelect={choice => select({ ...route, taskModelGroupId: choice?.groupId })} />
                   {action(`${m.choose}: ${model?.displayName ?? `${route.providerId} · ${route.modelId} · ${m.unavailable}`}`,
                     () => setChoosingTaskModel(value => !value), !editable)}
                   {choosingTaskModel && models.map(choice => <View key={`${choice.backendId}:${choice.key}`}>{action(`${m.title}: ${choice.displayName} · ${choice.providerName}`, () => {

@@ -62,13 +62,13 @@ export class ProviderGroupRemoteRouter implements ProviderGroupRemoteRouterPort 
     if (input.profile.fastMode === "ultrafast" && !model.supportsUltrafastMode || input.profile.fastMode === true && !model.supportsFastMode
       || input.profile.effort !== undefined && !model.thinkingLevels.includes(input.profile.effort)) throw new ProviderGroupUnavailableError();
     const status: ProviderGroupMemberStatus = { member, model, available: true, reachable: true, running: picked.running, quota: picked.quota ? { ...picked.quota } : { limited: false },
-      assertCurrent: () => { owner.assertCurrent(); source.assertCurrent(); signal.throwIfAborted(); } };
+      assertCurrent: (active = signal) => { owner.assertCurrent(); source.assertCurrent(); active.throwIfAborted(); } };
     const profile = { ...input.profile, backendId: member.backendId, providerId: member.providerId, modelId: member.backendId === input.group.backendId ? input.modelId : model.modelId };
     const directMember = profile.backendId !== input.group.backendId || original.kind === "local" && original.nodeId === owner.ownerNodeId
       && original.nativeBackendId === owner.nativeBackendId && original.providerId === input.group.providerId;
     this.options.sources.prepareGroupMember(input.sessionId, directMember ? profile.backendId : "");
     const reservation = this.options.leases.reserve({ sessionId: input.sessionId, memberKey: member.key, backendId: profile.backendId, providerId: profile.providerId }); let committed = false;
-    const assertCurrent = () => { status.assertCurrent(); const current = this.options.store.snapshot(input.group); if (current.revision !== snapshot.revision || current.ownerNodeId !== owner.ownerNodeId) throw new ProviderGroupUnavailableError(); };
+    const assertCurrent = (active = signal) => { status.assertCurrent(active); const current = this.options.store.snapshot(input.group); if (current.revision !== snapshot.revision || current.ownerNodeId !== owner.ownerNodeId) throw new ProviderGroupUnavailableError(); };
     return { group: input.group, snapshot, member, status, profile, assertCurrent, release: reservation.release, commit: () => {
       if (committed) return; assertCurrent(); this.options.store.commitBinding(input.sessionId, { group: input.group, groupRevision: snapshot.revision.toString(), memberKey: member.key,
         backendId: profile.backendId, providerId: profile.providerId, modelId: profile.modelId, ownerNodeId: owner.ownerNodeId }, snapshot.revision); committed = true;

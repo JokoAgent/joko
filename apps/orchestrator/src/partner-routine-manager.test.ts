@@ -139,6 +139,18 @@ describe("Partner routine authority and independent execution", () => {
     expect(f.profiles.getSessionLink('routine-unknown-native')).toMatchObject({ role: 'routine', routineKey: input.key, partnerId: f.partner.id });
   });
 
+  it("keeps group fallback on the routine's original profile version", async () => {
+    const f = await fixture(), exact = f.partner.capabilities.modelChain[0]!;
+    const grouped = await f.partners.updatePartner(f.partner.id, f.partner.revision, {
+      capabilities: { ...f.partner.capabilities, modelChain: [{ ...exact, taskModelGroupId: "writers" }] } });
+    const { id: sessionId } = await f.partners.ensureRoutineSession({ partnerId: grouped.id, key: "routine:group",
+      title: "Group", assertCurrent: () => undefined });
+    await f.partners.updatePartner(grouped.id, grouped.revision, { capabilities: f.partner.capabilities });
+    const first = { ...exact, backendId: "another-local" };
+    expect(f.partners.routineFallback({ sessionId, current: exact, currentHop: 0, visitedRoutes: [] },
+      id => id === "writers" ? [first, exact] : undefined)).toEqual({ owned: true, candidate: first });
+  });
+
   it('keeps archived routine history and starts the next trigger only after the original native close is confirmed', async () => {
     const f = await fixture();
     const input = { partnerId: f.partner.id, key: 'routine:archived', title: 'Archived review', assertCurrent: () => undefined };

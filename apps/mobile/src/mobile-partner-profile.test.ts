@@ -47,7 +47,7 @@ describe("mobile Partner profile validation", () => {
     expect(() => validateMobilePartnerProfileDraft(snapshot, { ...draft, capabilities: { ...draft.capabilities, permissionMode: "auto" } })).toThrow(/available/u);
   });
   it("projects and validates an independent task route without changing inherited primary settings", () => {
-    const task = { ...profilePartner.capabilities.modelChain[0]!, backendId: "task-backend", modelId: "task-model" };
+    const task = { ...profilePartner.capabilities.modelChain[0]!, backendId: "task-backend", modelId: "task-model", taskModelGroupId: "work" };
     const model = { ...profileSnapshot.models[0]!, backendId: task.backendId, modelId: task.modelId,
       canSetEffort: true, canSetFastMode: true, canSetPlanMode: true, permissionModes: ["ask", "auto"] as const };
     const snapshot = { ...profileSnapshot, taskModels: [model] };

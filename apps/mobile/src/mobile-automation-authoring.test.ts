@@ -15,6 +15,7 @@ import {
   ScheduleExecutionMode,
   ScheduleGeneratedSessionDisposition,
   ScheduleSessionMode,
+  SessionAutomationOriginSchema,
   SessionSchema,
   SessionState,
   SnapshotSchema,
@@ -80,6 +81,29 @@ describe("mobile Automation authoring", () => {
     expect(schedule.execution?.model).toBeUndefined();
     expect(boundSession?.backendId).toBe("paired-pi");
     expect(() => buildMobileAutomationScheduleInput(owner, draft, undefined, undefined)).toThrow(/active task/);
+  });
+  it("retains a group-only Schedule and its own persistent task after the group adopts a local Backend", () => {
+    const owner = authoringOwner(), original = owner.sessions[0]!;
+    original.backendId = "chosen-backend";
+    original.location = owner.targets[0]!.location!;
+    original.automationOrigin = create(SessionAutomationOriginSchema, { scheduleId: "grouped", runId: "first" });
+    const existing: MobileAutomationSchedule = {
+      scheduleId: "grouped", displayName: "Original", state: "enabled", source: "dialogue", backendId: "backend",
+      targetId: "target", sessionMode: "persistent", sessionId: original.sessionId, recurrence: "manual", recurrenceLabel: "Manual",
+      recurrenceExpression: "", timeZone: "UTC", inputText: "Run", editableInputText: "Run", taskModelGroupId: "work",
+      executionMode: "agent", permissionMode: "ask", planMode: false, useWorktree: false, refreshWorktreeRemote: false,
+      extraDirectoryIds: [], silentWhenIdle: false, notifyDesktop: true, overlapPolicy: "queue", misfirePolicy: "runOnce",
+      unreadRunCount: 0, recentRuns: [], revision: { value: 2n, etag: "grouped-r2" }, generation: 1n
+    };
+    const draft = { ...createMobileAutomationDraft(owner, existing), name: "Renamed" };
+    expect(draft.model).toBeUndefined();
+    const saved = buildMobileAutomationScheduleInput(owner, draft, existing, undefined);
+    expect(saved.schedule).toMatchObject({ displayName: "Renamed", backendId: "backend", targetId: "target",
+      sessionId: original.sessionId, execution: { taskModelGroupId: "work" } });
+    expect(saved.schedule.execution?.model).toBeUndefined();
+    expect(saved.boundSession?.backendId).toBe("chosen-backend");
+    owner.sessions[0]!.automationOrigin!.scheduleId = "another-schedule";
+    expect(() => buildMobileAutomationScheduleInput(owner, draft, existing, undefined)).toThrow(/binding/);
   });
   it.each([
     ["America/New_York", "2026-11-01T06:30:00.000Z", "2026-11-01T05:45:00Z", "2026-11-01T01:30", "2026-11-01T02:30", "2026-11-01T07:30:00Z"],

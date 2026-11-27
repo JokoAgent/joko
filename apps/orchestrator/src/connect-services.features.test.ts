@@ -5058,6 +5058,21 @@ describe("Connect typed feature boundaries", () => {
     });
     expect(captured.executionSnapshot.extraDirectoryIds).toEqual(["extra-1"]);
 
+    const grouped = schedule([]);
+    grouped.execution!.model = undefined;
+    grouped.execution!.taskModelGroupId = "work";
+    const submitGrouped = (operationId: string) => invoke(services.operation.submitOperation, {
+      operationId, connectionId: connection.id, mutation: mutation(grouped)
+    });
+    await submitGrouped("operation-schedule-group-only");
+    expect(captured.executionSnapshot).toMatchObject({ taskModelGroupId: "work", permissionMode: "auto", planMode: true });
+    expect(captured.executionSnapshot.modelId).toBeUndefined();
+    grouped.execution!.taskModelGroupId = " work";
+    await expect(submitGrouped("operation-schedule-invalid-group")).rejects.toMatchObject({ code: Code.InvalidArgument });
+    grouped.execution!.taskModelGroupId = "work";
+    grouped.execution!.executionMode = contract.ScheduleExecutionMode.SCRIPT;
+    await expect(submitGrouped("operation-schedule-script-group")).rejects.toMatchObject({ code: Code.InvalidArgument });
+
     const anchorAt = now + 60 * 60_000;
     const intervalSchedule = create(contract.ScheduleInputSchema, {
       ...schedule([]),

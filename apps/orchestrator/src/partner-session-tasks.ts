@@ -7,12 +7,11 @@ import { NotFoundError, type OperationalStore, type PartnerModelRouteRecord, typ
 import type { PartnerManager } from "./partner-manager.js";
 import type { SessionHost, InteractionDecisionSubmission } from "./session-host.js";
 import type { WorkspaceService } from "./workspace-service.js";
-import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 import { checkPartnerWorkbenchProject } from "./partner-workbench-project.js";
 import { persistSessionTaskActivity } from "./session-task-activity.js";
 import type { PartnerHomeProjects } from "./partner-home-projects.js";
 import { readPartnerSessionTaskGroupOrigin, type PartnerSessionTaskGroupOrigin, type PartnerSessionTaskGroupPublisher } from "./partner-session-task-group-publisher.js";
-import { partnerTaskContextUsage, suggestPartnerTaskRoute } from "./partner-task-route.js";
+import { nextPartnerFallback, partnerTaskContextUsage, suggestPartnerTaskRoute, type PartnerFallbackInput, type PartnerGroupRoutes } from "./partner-task-route.js";
 
 const SCOPE = "partner.session-tasks";
 const DEFAULT_RESUME_INPUT = "Continue from the existing task history after the requested pause. Check completed actions; do not replay the original request.";
@@ -122,12 +121,10 @@ export class PartnerSessionTaskManager {
       || this.partners.listPendingDeletions().some(deletion => deletion.partnerId === partnerId); }
     catch { return true; }
   }
-  fallback(input: { readonly sessionId: string; readonly current: SessionRuntimeProfile; readonly visitedRoutes: readonly string[]; readonly currentHop: number }) {
+  fallback(input: PartnerFallbackInput, groupRoutes?: PartnerGroupRoutes) {
     const id = this.#sessions.get(input.sessionId); if (!id) return { owned: false };
-    const task = this.#read(id), key = (route: SessionRuntimeProfile) => `${route.backendId}\0${route.providerId}\0${route.modelId}`;
-    if (task.explicitModel || input.currentHop >= task.routes.length - 1) return { owned: true };
-    const visited = new Set([...input.visitedRoutes, key(input.current)]), index = task.routes.findIndex(route => key(route) === key(input.current));
-    const candidate = task.routes.slice(Math.max(0, index + 1)).find(route => !visited.has(key(route)));
+    const task = this.#read(id);
+    const candidate = task.explicitModel ? undefined : nextPartnerFallback(task.routes, input, groupRoutes);
     return candidate === undefined ? { owned: true } : { owned: true, candidate };
   }
   caller(sessionId: string) {
@@ -840,6 +837,8 @@ function readRecord(value: unknown): PartnerSessionTaskRecord {
 }
 function validRoute(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false; const route = value as Record<string, unknown>;
-  return Object.keys(route).every(key => ["backendId", "providerId", "modelId", "effort", "fastMode"].includes(key))
+  return Object.keys(route).every(key => ["backendId", "providerId", "modelId", "effort", "fastMode", "taskModelGroupId"].includes(key))
+    && (route["taskModelGroupId"] === undefined || typeof route["taskModelGroupId"] === "string" && route["taskModelGroupId"].length > 0
+      && route["taskModelGroupId"].length <= 96 && route["taskModelGroupId"].trim() === route["taskModelGroupId"] && !/[\p{Cc}\u2028\u2029]/u.test(route["taskModelGroupId"]))
     && ["backendId", "providerId", "modelId"].every(key => typeof route[key] === "string" && route[key] !== "") && (typeof route["fastMode"] === "boolean" || route["fastMode"] === "ultrafast") && (route["effort"] === undefined || typeof route["effort"] === "string");
 }

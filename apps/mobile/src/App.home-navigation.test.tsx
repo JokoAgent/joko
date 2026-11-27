@@ -9,7 +9,7 @@ import { SessionSchema, SessionState, SnapshotSchema, SnapshotScopeSchema, Owner
   TargetState, CapabilitySupport, CapabilitySchema, CapabilityManifestSchema, BackendDescriptorSchema, NativeSessionBindingSchema,
   TargetSchema, ToolCallState, WorkspaceDescriptorSchema, WorkspaceKind, capabilityNames } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
 import type { MobileHomeViewState } from "./mobile-task-home-navigation";
 import { DEFAULT_MOBILE_HOME_DISPLAY } from "./home-navigation";
@@ -105,6 +105,7 @@ const newTaskDrafts = new MobileNewTaskDraftStore({ getItem: async key => newTas
   setItem: async (key, value) => { newTaskDraftValues.set(key, value); }, removeItem: async key => { newTaskDraftValues.delete(key); } });
 const newTaskFlush = vi.spyOn(newTaskDrafts, "flush");
 const createNewTask = vi.fn<MobileClient["create"]>(async () => ({ created: false, sent: false, definitive: true }));
+const taskModelGroupTransport = vi.fn<MobileClient["taskModelGroupTransport"]>();
 const onBack = vi.fn(), onSearchFocus = vi.fn(), onNavigated = vi.fn();
 let dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 };
 let platformOS = "android";
@@ -159,6 +160,8 @@ const client = new Proxy({
   readTaskHeaderRole: async () => observedHeaderRole,
   taskCollaborationApi: () => collaborationApi,
   newTaskModels: () => empty,
+  taskModelGroupTransport,
+  refreshNewTaskGroupMedia: async () => {},
   restoreNewTaskModel: async (targetId: string) => targetId,
   newTaskWorktreeOwnerKey: (targetId: string) => `worktree-${targetId}`,
   loadNewTaskWorktree: async (targetId: string) => ({ targetId, eligibility: "eligible", canRefreshRemote: true,
@@ -368,6 +371,7 @@ beforeEach(async () => {
   observedHeaderRole = "ordinary"; shareSelectionActive = false;
   headerSourceEpoch = 0;
   createNewTask.mockClear();
+  taskModelGroupTransport.mockReset();
   await newTaskDrafts.clear({ profileId: "profile" });
   vi.useFakeTimers();
   for (const spy of [select, searchHome, scrollToIndex, scrollHomeTo, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
@@ -505,33 +509,48 @@ it("does not reposition the already mounted task list when the selected task cha
   expect(scrollHomeTo).not.toHaveBeenCalled();
 });
 
-it("restores the Worktree branch in the actual new-task form, submits it and clears it when another project is selected", async () => {
-  state = { ...state, owner: create(SnapshotSchema, { ...state.owner!,
+it.each([false, true])("restores and submits the Worktree branch with a selected model group (%s) and clears project choices on change", async withGroup => {
+  const consoleError = vi.spyOn(console, "error");
+  onTestFinished(() => consoleError.mockRestore());
+  state = { ...state, node: { serverId: "node", displayName: "Node", version: "1", apiVersion: "v1", health: 1, pairingEnabled: true },
+    owner: create(SnapshotSchema, { ...state.owner!,
     backends: [create(BackendDescriptorSchema, { backendId: "backend", capabilities: { capabilities: [create(CapabilitySchema,
       { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED })] } })],
     targets: [...state.owner!.targets.map(target => create(TargetSchema, { ...target, state: TargetState.ACTIVE })),
       create(TargetSchema, { targetId: "project-other", backendId: "backend", displayName: "Another project", state: TargetState.ACTIVE })] }) };
+  if (withGroup) taskModelGroupTransport.mockImplementation(targetId => targetId === "project" ? {
+    ownerKey: "node/project", list: async () => ({ revision: "12", groups: [{ id: "writers", name: "Writers" }] }),
+    preview: async () => undefined
+  } : undefined);
   newTaskDrafts.save({ profileId: "profile" }, { targetId: "project", name: "Review",
     input: plainTextMobileComposerDraft("Inspect this branch") });
   await newTaskDrafts.flush({ profileId: "profile" });
   const form = () => createElement(NewTaskScreen, { colors, state, locale: "en", onBack, onCreated: onNew,
     onImportedExistingTask() {}, showIncomingShareEmpty: false });
   await act(async () => root.render(form()));
+  if (withGroup) {
+    await press(message("models.group") + " · " + message("models.exact"));
+    await press("Writers");
+  }
   await press("Isolated Worktree"); await press("review");
   await newTaskDrafts.flush({ profileId: "profile" });
   await act(async () => root.unmount()); root = createRoot(host);
   await act(async () => root.render(form()));
   expect(button("Isolated Worktree").getAttribute("aria-checked")).toBe("true");
   expect(button("review").getAttribute("aria-checked")).toBe("true");
+  if (withGroup) expect(button(message("models.group") + " · Writers")).toBeDefined();
   await press(message("newTask.createAndSend"));
   await act(async () => { await vi.waitFor(() => expect(createNewTask).toHaveBeenCalledOnce()); });
   expect(createNewTask).toHaveBeenCalledWith("project", "Review", plainTextMobileComposerDraft("Inspect this branch"),
     undefined, undefined, expect.objectContaining({ optimisticConversation: true }),
-    { refreshRemote: false, sourceRef: "refs/heads/review" });
+    { refreshRemote: false, sourceRef: "refs/heads/review" },
+    ...(withGroup ? [{ groupId: "writers", revision: "12", targetId: "project", serverId: "node" }] : []));
   await press(mobileMessage("en", "newTask.projectAccessibility", { name: "Another project" }));
   expect(button("Isolated Worktree").getAttribute("aria-checked")).toBe("false");
   expect(newTaskDrafts.readSync({ profileId: "profile" })).toMatchObject({ targetId: "project-other" });
   expect(newTaskDrafts.readSync({ profileId: "profile" })?.worktree).toBeUndefined();
+  expect(newTaskDrafts.readSync({ profileId: "profile" })?.taskModelGroup).toBeUndefined();
+  expect(consoleError.mock.calls.some(([message]) => String(message).includes("Cannot update a component"))).toBe(false);
 });
 
 async function renderTask(patch: Partial<TaskProps> = {}): Promise<void> {

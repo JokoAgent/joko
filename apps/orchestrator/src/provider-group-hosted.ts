@@ -8,7 +8,7 @@ import type { HostedAgentCall } from "./hosted-agent-run.js";
 import { HostedAgentExchange, HOSTED_AGENT_UNREAD_LIMIT, type HostedAgentFrame } from "./hosted-agent-exchange.js";
 import { HostedAgentPoller, type HostedAgentTransport } from "./hosted-agent-poller.js";
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
-import type { ProviderGroupAssignment } from "./provider-group-router.js";
+import type { ProviderGroupAssignment, ProviderGroupHostedSelection } from "./provider-group-router.js";
 import { decideProviderGroupFailure, providerGroupFailureSignals, ProviderGroupUnavailableError } from "./provider-group-failure-policy.js";
 import type { HostedAgentRunPort } from "./hosted-agent-controller.js";
 import type { HostedNativeInferenceRequest } from "@joko/adapter-hosted";
@@ -374,13 +374,13 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
     const failures = new Set(runtime.router.tried(sessionId));
     let capacityFailure: unknown;
     for (;;) {
-      this.#assertEntry(entry); let assignment: ProviderGroupAssignment | undefined;
+      this.#assertEntry(entry); let assignment: ProviderGroupHostedSelection | undefined;
       if (retained) entry.binding = retained;
       else {
         const source = runtime.directory.sources().find(source => source.backendId === entry.input.backendId && source.providerId === entry.input.providerId);
         if (!source) throw new ProviderGroupUnavailableError();
         try {
-          const prepared = entry.principal.trust === "owner" ? runtime.router.takeRemoteSelection(entry.principal.deviceId, entry.input.sessionId, group) : undefined;
+          const prepared = entry.principal.trust === "owner" ? runtime.router.takeRemoteSelection(entry.principal.deviceId, entry.input.sessionId, entry.input, entry.lifetime.signal) : undefined;
           assignment = prepared
             ?? await runtime.router.pick({ sessionId, group, profile: { backendId: group.backendId, providerId: group.providerId, modelId: entry.input.modelId, fastMode: entry.input.fastMode,
             ...(entry.input.effort === undefined ? {} : { effort: entry.input.effort }) }, agentKind: source.agentKind, modelId: entry.input.modelId, logicalModelId: entry.input.modelId,

@@ -12,6 +12,7 @@ export interface ProviderGroupMember extends ProviderGroupKey {
   readonly key: string; readonly kind: "local" | "device" | "share"; readonly nodeId: string; readonly displayName: string;
   readonly nativeBackendId: string;
   readonly capacity: number; readonly weight: number; readonly paused: boolean;
+  readonly unlimitedCapacity?: boolean;
   readonly received?: ProviderGroupReceivedIdentity;
 }
 export interface ProviderGroupConfig {
@@ -204,15 +205,20 @@ export class ProviderGroupStore {
 }
 export function groupKey(key: ProviderGroupKey): string { validKey(key); return JSON.stringify([key.backendId, key.providerId]); }
 export function sameProviderGroupKey(a: ProviderGroupKey, b: ProviderGroupKey): boolean { return sameKey(a, b); }
+export function providerGroupCapacity(member: ProviderGroupMember): number {
+  return member.unlimitedCapacity === true ? Number.POSITIVE_INFINITY : member.capacity;
+}
 export function assertProviderGroupConfig(value: unknown): asserts value is ProviderGroupConfig {
   if (!object(value) || !keys(value, ["strategy", "autoSwitch", "members"]) || !STRATEGIES.includes(String(value["strategy"]))
     || typeof value["autoSwitch"] !== "boolean" || !Array.isArray(value["members"]) || value["members"].length > 512) throw invalid();
   const seen = new Set<string>();
   for (const member of value["members"]) {
-    if (!object(member) || !keys(member, ["key", "kind", "backendId", "nativeBackendId", "providerId", "nodeId", "displayName", "capacity", "weight", "paused", "received"])
+    if (!object(member) || !keys(member, ["key", "kind", "backendId", "nativeBackendId", "providerId", "nodeId", "displayName", "capacity", "unlimitedCapacity", "weight", "paused", "received"])
       || !["local", "device", "share"].includes(String(member["kind"])) || !bounded(member["key"]) || seen.has(member["key"])
       || !bounded(member["backendId"]) || !bounded(member["nativeBackendId"]) || !bounded(member["providerId"]) || !bounded(member["nodeId"]) || !bounded(member["displayName"])
-      || !integer(member["capacity"], 1, 16) || !integer(member["weight"], 1, 100) || typeof member["paused"] !== "boolean") throw invalid();
+      || !integer(member["capacity"], 1, 16) || (member["unlimitedCapacity"] !== undefined && typeof member["unlimitedCapacity"] !== "boolean")
+      || (member["unlimitedCapacity"] === true && member["capacity"] !== 4)
+      || !integer(member["weight"], 1, 100) || typeof member["paused"] !== "boolean") throw invalid();
     seen.add(member["key"]);
     if (member["kind"] === "share") assertReceived(member["received"]); else if (member["received"] !== undefined) throw invalid();
   }

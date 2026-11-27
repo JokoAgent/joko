@@ -56,6 +56,17 @@ async function fixture() {
   return { root, store, profiles, groups, artifacts, adapter, workspaces, host, runtime, partners, members, group, ensure };
 }
 describe("Hidden Partner group native execution", () => {
+  it("uses the lane's saved group version and native visited identities when choosing a fallback", async () => {
+    const f = await fixture(), partner = f.members[0]!, exact = partner.capabilities.modelChain[0]!;
+    const updated = await f.partners.updatePartner(partner.id, partner.revision, {
+      capabilities: { ...partner.capabilities, modelChain: [{ ...exact, taskModelGroupId: "writers" }] } });
+    const lane = await f.ensure();
+    await f.partners.updatePartner(updated.id, updated.revision, { capabilities: partner.capabilities });
+    const first = { ...exact, backendId: "other-local" }, members = (id: string) => id === "writers" ? [first, exact] : undefined;
+    const input = { sessionId: lane.sessionId, current: exact, currentHop: 0, visitedRoutes: [] };
+    expect(f.runtime.fallback(input, members)).toEqual({ owned: true, candidate: first });
+    expect(f.runtime.fallback({ ...input, visitedRoutes: [[first.backendId, first.providerId, first.modelId].join("\0")] }, members)).toEqual({ owned: true });
+  });
   it("consumes exact Full access on its owned group lane and applies the next profile without rewriting old versions", async () => {
     const f = await fixture(); const before = f.profiles.getPartner(f.members[0]!.id);
     const full = await f.partners.updatePartner(before.id, before.revision, { capabilities: { ...before.capabilities, permissionMode: "bypassPermissions" } });

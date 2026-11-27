@@ -74,6 +74,17 @@ it("edits and saves the independent input handoff switch while disabling edits f
   await render(inheritedTransport, undefined, inherited);
   expect(container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!.disabled).toBe(true);
 });
+it("saves a selected model group with its original concrete Partner route", async () => {
+  const active = transport();
+  vi.mocked(active.load).mockResolvedValue({ ...profileSnapshot, options: { ...profileSnapshot.options, modelGroups: { revision: "7", groups: [{ id: "work", name: "Work" }] } } });
+  await render(active);
+  await press("Model group · Use a specific model");
+  await press("Work");
+  await press("Save Partner");
+  expect(vi.mocked(active.save).mock.calls[0]?.[1].capabilities.modelChain).toEqual([
+    { ...profilePartner.capabilities.modelChain[0]!, taskModelGroupId: "work" }
+  ]);
+});
 async function render(active?: MobilePartnerProfileTransport, resumeFactory?: (partner: typeof profilePartner) => PartnerResumeEditor | undefined,
   partner = profilePartner,
   memoryFactory?: (partner: typeof profilePartner, ownerKey: string) => PartnerMemoryEditor | undefined,

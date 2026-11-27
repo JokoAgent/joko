@@ -1,5 +1,6 @@
 import { Host } from "@expo/ui";
-import { BottomSheet, Button, Form, Group, Picker, ProgressView, Section, Text, TextField, Toggle, useNativeState } from "@expo/ui/swift-ui";
+import { BottomSheet, Button, Form, Group, Picker, ProgressView, Section, Text, TextField, useNativeState } from "@expo/ui/swift-ui";
+import { mobileModelSpeedChoices } from "./MobileModelSpeedControl";
 import { accessibilityLabel, buttonStyle, disabled, font, foregroundStyle, frame, lineLimit, onLongPressGesture, pickerStyle, presentationDragIndicator, tag } from "@expo/ui/swift-ui/modifiers";
 import { CollaborationWorkerStatus } from "@joko/contracts";
 import type { MobileCollaborationNativeSheetProps } from "./MobileCollaborationNativeSheet";
@@ -57,6 +58,7 @@ function WorkerForm(props: MobileCollaborationNativeSheetProps & { readonly form
   const target = props.targets.find(value => value.id === form.targetId), model = target?.models.find(value => value.providerId === form.model?.providerId && value.modelId === form.model?.modelId);
   const patch = (value: Partial<MobileWorkerForm>) => props.onForm({ ...form, ...value });
   const preset = mobileWorkerRoles.includes(form.role as typeof mobileWorkerRoles[number]);
+  const speeds = mobileModelSpeedChoices(locale, model?.supportsFastMode === true, model?.supportsUltrafastMode).filter(choice => choice.enabled);
   return <>
     <Section title={copy.role}><Picker label={copy.role} selection={preset ? form.role : "custom"} onSelectionChange={value => patch({ role: value === "custom" ? "" : value })}
       modifiers={[pickerStyle("menu"), disabled(block)]}>
@@ -77,7 +79,13 @@ function WorkerForm(props: MobileCollaborationNativeSheetProps & { readonly form
       modifiers={[pickerStyle("menu"), disabled(block)]}>
       <Text modifiers={[tag("default")]}>{copy.defaultModel}</Text>{model.efforts.map(value => <Text key={value.id} modifiers={[tag(value.id)]}>{value.label || value.id}</Text>)}
     </Picker>}
-    {model?.supportsFastMode && target?.canSetFastMode && <Toggle label={copy.fast} isOn={form.model?.fastMode === true} onIsOnChange={fastMode => patch({ model: { ...form.model!, fastMode } })} modifiers={[disabled(block)]} />}
+    {form.model && target?.canSetFastMode && model?.canSetFastMode !== false && speeds.length > 1 &&
+      <Picker label={locale === "zh-CN" ? "速度" : "Speed"} selection={String(form.model.fastMode)} onSelectionChange={value => {
+        const selected = speeds.find(choice => String(choice.value) === value);
+        if (selected) patch({ model: { ...form.model!, fastMode: selected.value } });
+      }} modifiers={[pickerStyle("menu"), disabled(block)]}>
+        {speeds.map(choice => <Text key={String(choice.value)} modifiers={[tag(String(choice.value))]}>{choice.label}</Text>)}
+      </Picker>}
     </Section>
     <Section title={copy.permission}><Picker label={copy.permission} selection={String(form.permissionMode)} onSelectionChange={value => patch({ permissionMode: Number(value) })} modifiers={[pickerStyle("menu"), disabled(block)]}>
       {target?.permissionModes.map(value => <Text key={value} modifiers={[tag(String(value))]}>{mobilePermissionModeLabel(value, locale)}</Text>)}

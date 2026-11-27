@@ -49,6 +49,19 @@ class RecordedAdapter extends FakeBackendAdapter {
   }
 }
 describe("Partner independent Session tasks", () => {
+  it("uses the independent task's frozen group chain after the Partner model settings change", async () => {
+    const f = await fixture(), exact = f.partner.capabilities.modelChain[0]!;
+    const grouped = await f.partners.updatePartner(f.partner.id, f.partner.revision, {
+      capabilities: { ...f.partner.capabilities, modelChain: [{ ...exact, taskModelGroupId: "writers" }] } });
+    const task = await f.tasks.start(f.parent, "task:frozen-group", { instruction: "Keep the original work" }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs).toHaveLength(1));
+    await f.partners.updatePartner(grouped.id, grouped.revision, { capabilities: f.partner.capabilities });
+    const first = { ...exact, backendId: f.secondary.id };
+    expect(f.tasks.fallback({ sessionId: task.sessionId!, current: exact, currentHop: 0, visitedRoutes: [] },
+      id => id === "writers" ? [first, exact] : undefined)).toEqual({ owned: true, candidate: first });
+    await f.primary.complete(task.sessionId!, "Retained result");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]!.status).toBe("completed"));
+  });
   it("keeps each execution receipt in the original Owner timeline before attempting the hidden return", async () => {
     const f = await fixture();
     const parentGeneration = f.store.getSession(f.parent).descriptor.binding.generation;

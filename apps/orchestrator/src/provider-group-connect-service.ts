@@ -5,6 +5,7 @@ import { groupKey, RevisionConflictError, type ProviderGroupKey, type ProviderGr
 import type { ProviderAccountUsageSnapshot } from "@joko/core";
 import type { ProviderGroupService } from "./provider-group-service.js";
 import type { ProviderGroupUsage } from "./provider-group-usage.js";
+import { providerGroupDefaultMember } from "./provider-group-directory.js";
 import { toProtoModelDescriptor } from "./proto-mapper.js";
 import { fromGroupConfig, fromGroupKey, fromGroupUsage, toGroupAccountUsage, toGroupMember, toGroupSnapshot, toGroupUsage } from "./provider-group-wire.js";
 import { ProviderGroupUnavailableError } from "./provider-group-failure-policy.js";
@@ -112,14 +113,13 @@ export function createProviderGroupConnectService(options: ProviderGroupConnectO
     }),
     listProviderGroupCandidates: (request, context) => invoke(context, true, async principal => {
       const candidates = await service.candidates(key(request.key, principal), context.signal);
-      return create(contract.ListProviderGroupCandidatesResponseSchema, { candidates: candidates.map(candidate => ({ member: toGroupMember({ key: candidate.key, kind: candidate.kind,
-        backendId: candidate.backendId, nativeBackendId: candidate.nativeBackendId, providerId: candidate.providerId, nodeId: candidate.nodeId, displayName: candidate.displayName,
-        capacity: 4, weight: 1, paused: false, ...(candidate.received === undefined ? {} : { received: candidate.received }) }), providerName: candidate.providerName,
+      return create(contract.ListProviderGroupCandidatesResponseSchema, { candidates: candidates.map(candidate => ({ member: toGroupMember(providerGroupDefaultMember(candidate)), providerName: candidate.providerName,
         agentKind: candidate.agentKind, available: candidate.available, remotelyEnabled: candidate.remotelyEnabled, models: candidate.models.map(model => toProtoModelDescriptor(candidate.backendId, model)) })) });
     }),
     updateProviderGroup: (request, context) => invoke(context, true, async principal => {
       if (request.update.case !== "config" && request.update.case !== "delete") throw new ConnectError("A Provider group update is required.", Code.InvalidArgument);
-      const value = await service.update(key(request.key, principal), request.update.case === "delete" ? undefined : fromGroupConfig(request.update.value), request.expectedRevision, context.signal);
+      const group = key(request.key, principal);
+      const value = await service.update(group, request.update.case === "delete" ? undefined : fromGroupConfig(request.update.value, service.snapshot(group).config), request.expectedRevision, context.signal);
       return create(contract.UpdateProviderGroupResponseSchema, { group: toGroupSnapshot(value) });
     }),
     getProviderGroupUsage: (request, context) => invoke(context, false, async principal => create(contract.GetProviderGroupUsageResponseSchema, { rows: options.usage.usage.rows({ group: key(request.key, principal),
@@ -149,11 +149,16 @@ export function createProviderGroupConnectService(options: ProviderGroupConnectO
         ...(request.quotaRebalanceFromMemberKey === undefined ? {} : { quotaRebalanceFrom: request.quotaRebalanceFromMemberKey }),
         modelId: request.modelId, ...(request.logicalModelId === undefined ? {} : { logicalModelId: request.logicalModelId }), ownTask: false, fresh: request.excludeMemberKeys.length > 0,
         exclude: new Set(request.excludeMemberKeys) }, context.signal);
-      assignment.assertCurrent(); principal.assertCurrent(); service.router.rememberRemoteSelection(principal.id, request.sessionId, assignment);
-      // Keep the 30-second provisional pick until a real full lease report
-      // replaces it. It is a soft counter, not a native process reservation.
-      return create(contract.PickProviderGroupMemberResponseSchema, { group: toGroupSnapshot(assignment.snapshot), member: toGroupMember(assignment.member), modelId: assignment.profile.modelId,
-        quota: assignment.status.quota, running: assignment.status.running });
+      try {
+        assignment.assertCurrent(); principal.assertCurrent();
+        const response = create(contract.PickProviderGroupMemberResponseSchema, { group: toGroupSnapshot(assignment.snapshot), member: toGroupMember(assignment.member), modelId: assignment.profile.modelId,
+          quota: assignment.status.quota, running: assignment.status.running });
+        service.router.rememberRemoteSelection(principal.id, request.sessionId, request.modelId, assignment);
+        return response;
+      } catch (error) {
+        assignment.release();
+        throw error;
+      }
     }),
     coolProviderGroupMember: (request, context) => invoke(context, false, async principal => {
       const group = key(request.key, principal), member = service.snapshot(group).config?.members.find(member => member.key === request.memberKey);

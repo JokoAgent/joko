@@ -1,10 +1,11 @@
 import { CollaborationGoalStatus, CollaborationWorkerStatus, PermissionMode, type CollaborationWorker } from "@joko/contracts";
-import { Pressable, StyleSheet, Switch, Text, TextInput, View } from "react-native";
+import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { MobileModelSpeedControl } from "./MobileModelSpeedControl";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import { mobileWorkerRoles, normalizeMobileWorkerForm, type MobileCollaborationView, type MobileWorkerForm, type MobileWorkerTarget } from "./mobile-collaboration";
 import { mobileCollaborationCopy } from "./mobile-collaboration-messages";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
-import { mobilePermissionModeLabel } from "./mobile-runtime-controls";
+import { mobileModelSupportsSpeed, mobilePermissionModeLabel } from "./mobile-runtime-controls";
 import { useState } from "react";
 
 export interface MobileCollaborationViewProps {
@@ -48,7 +49,7 @@ export function mobileWorkerFormValid(form: MobileWorkerForm | undefined, target
     && form.model.effortId === target.defaultModel.effortId && form.model.fastMode === target.defaultModel.fastMode;
   return !!target && target.permissionModes.includes(form.permissionMode) && (!form.model || defaultSelection || !!route
     && (!form.model.effortId || target.canSetEffort && route.efforts.some(value => value.id === form.model!.effortId))
-    && (!form.model.fastMode || target.canSetFastMode && route.supportsFastMode));
+    && (!form.model.fastMode || target.canSetFastMode && route.canSetFastMode !== false && mobileModelSupportsSpeed(route, form.model.fastMode)));
 }
 export function mobileCollaborationCapacity(view: MobileCollaborationView, locale: MobileSupportedLocale): string | undefined {
   if (!view.settings) return undefined;
@@ -117,8 +118,9 @@ function WorkerForm(props: MobileCollaborationViewProps & { readonly form: Mobil
     {model && target?.canSetEffort && model.efforts.length > 0 && choices("effort", `${copy.effort} · ${form.model?.effortId || copy.defaultModel}`,
       [{ id: "default", label: copy.defaultModel, select: () => patch({ model: { ...form.model!, effortId: undefined } }) }, ...model.efforts.map(value => ({ id: value.id, label: value.label || value.id,
         select: () => patch({ model: { ...form.model!, effortId: value.id } }) }))])}
-    {model?.supportsFastMode && target?.canSetFastMode && <View style={styles.row}><Text style={{ color: colors.ink }}>{copy.fast}</Text><Switch accessibilityLabel={copy.fast}
-      disabled={disabled} value={form.model?.fastMode === true} onValueChange={fastMode => patch({ model: { ...form.model!, fastMode } })} /></View>}
+    {model && target?.canSetFastMode && model.canSetFastMode !== false && (model.supportsFastMode || model.supportsUltrafastMode) &&
+      <MobileModelSpeedControl value={form.model!.fastMode} supportsFast={model.supportsFastMode} supportsUltrafast={model.supportsUltrafastMode}
+        disabled={disabled} colors={colors} locale={locale} onChange={fastMode => patch({ model: { ...form.model!, fastMode } })} />}
     <Text style={[styles.label, { color: colors.ink }]}>{copy.permission}</Text>
     {choices("permission", mobilePermissionModeLabel(form.permissionMode, locale), (target?.permissionModes ?? []).map(value => ({ id: String(value), label: mobilePermissionModeLabel(value, locale), select: () => patch({ permissionMode: value }) })))}
     <Text style={[styles.label, { color: colors.ink }]}>{copy.initialTask}</Text><TextInput accessibilityLabel={copy.initialTask} value={form.initialTask} multiline maxLength={32_000}

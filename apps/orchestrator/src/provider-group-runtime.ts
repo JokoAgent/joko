@@ -139,7 +139,7 @@ export class ProviderGroupRuntime {
         result.push({ backendId: backend.id, nativeBackendId: backend.id, nativeBackendInstanceGeneration: generation, providerId, key: providerGroupMemberKey(options.nodeId, backend.id, providerId), kind: "local", nodeId: options.nodeId,
           displayName: options.nodeName(), providerName: provider?.displayName ?? providerId, agentKind: backend.adapterKind,
           available: backend.health !== "unavailable" && models.length > 0 && (!provider || ["authenticated", "not_required"].includes(provider.authenticationState)), remotelyEnabled: true, models,
-          ...providerBrand(provider?.accessKind, provider?.accessProduct),
+          accessKind: provider?.accessKind, ...providerBrand(provider?.accessKind, provider?.accessProduct),
           ...(options.openAiAccount ? { openAiAccount: (modelId: string) => options.openAiAccount!(backend.id, providerId, modelId) } : {}),
           assertCurrent: () => { const current = options.registry.get(backend.id); if (current.generation !== generation || current.state !== "available") throw new Error("The Provider Backend incarnation changed."); } });
       }
@@ -152,7 +152,8 @@ export class ProviderGroupRuntime {
         backendId: entry.backendId, nativeBackendId: entry.source.backendId, nativeBackendInstanceGeneration: Number(entry.catalog.instanceGeneration),
         providerId: provider.providerId, kind: entry.received ? "share" : "device", nodeId: executionNodeId,
         displayName: entry.name, providerName: provider.displayName, agentKind: entry.catalog.nativeAdapterKind, available: entry.available && provider.connected,
-        remotelyEnabled: provider.remoteInvocationEnabled, models, ...(entry.received ? { received: entry.received } : {}), ...providerBrand(provider.accessKind, provider.accessProduct),
+        remotelyEnabled: provider.remoteInvocationEnabled, models, ...(entry.received ? { received: entry.received } : {}),
+        accessKind: provider.accessKind, ...providerBrand(provider.accessKind, provider.accessProduct),
         assertCurrent: () => {
           if (entry.received) { if (!options.sharing) throw new Error("The Provider share directory is unavailable."); options.sharing.assertReceived(entry.received); }
           else options.sources.captureGroupPeer(entry.backendId).assertCurrent();

@@ -10,7 +10,7 @@ export interface ProviderGroupDirectorySource extends ProviderGroupKey {
   readonly nativeBackendId: string;
   readonly nativeBackendInstanceGeneration?: number;
   readonly providerName: string; readonly agentKind: string; readonly available: boolean; readonly remotelyEnabled: boolean;
-  readonly models: readonly ProviderModel[]; readonly brand?: string;
+  readonly models: readonly ProviderModel[]; readonly brand?: string; readonly accessKind?: string;
   readonly received?: ProviderGroupMember["received"];
   /** Exact live registry/route/grant generation, checked again at admission. */
   readonly assertCurrent: () => void;
@@ -18,7 +18,7 @@ export interface ProviderGroupDirectorySource extends ProviderGroupKey {
 
 export function providerGroupDefaultMember(source: ProviderGroupDirectorySource): ProviderGroupMember {
   return { key: source.key, kind: source.kind, backendId: source.backendId, nativeBackendId: source.nativeBackendId,
-    providerId: source.providerId, nodeId: source.nodeId, displayName: source.displayName, capacity: 4, weight: 1,
+    providerId: source.providerId, nodeId: source.nodeId, displayName: source.displayName, capacity: 4, unlimitedCapacity: true, weight: 1,
     paused: false, ...(source.received === undefined ? {} : { received: source.received }) };
 }
 
@@ -26,7 +26,7 @@ export interface ProviderGroupMemberStatus {
   readonly member: ProviderGroupMember; readonly available: boolean; readonly reachable: boolean;
   readonly model?: ProviderModel; readonly quota: ProviderGroupQuota; readonly running: number;
   readonly reason?: "offline" | "paused" | "model" | "authorization" | "quota" | "cooling";
-  readonly assertCurrent: () => void;
+  readonly assertCurrent: (signal?: AbortSignal) => void;
 }
 export interface ProviderGroupDirectoryOptions {
   readonly sources: () => readonly ProviderGroupDirectorySource[];
@@ -67,8 +67,8 @@ export class ProviderGroupDirectory {
     if (!model) return unavailable("model");
     const account = request.localAccounts ? source.openAiAccount?.(model.modelId) : undefined;
     if (request.localAccounts && (!account || !request.ownTask || source.kind !== "local")) return unavailable("authorization");
-    const assertCurrent = () => {
-      signal.throwIfAborted(); if (generation !== this.options.ownerGeneration()) throw new Error("Provider group owner changed.");
+    const assertCurrent = (active = signal) => {
+      active.throwIfAborted(); if (generation !== this.options.ownerGeneration()) throw new Error("Provider group owner changed.");
       source.assertCurrent();
       if (account && source.openAiAccount?.(model.modelId)?.generation !== account.generation) throw new Error("Local OpenAI credential changed.");
       if (source.kind === "share") {

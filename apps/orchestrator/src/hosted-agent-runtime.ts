@@ -17,6 +17,11 @@ import type { HostedAgentNativeMcp } from "./hosted-agent-native-mcp.js";
 import { HostedAgentDerivations } from "./hosted-agent-derivations.js";
 import { HostedAgentWorkflowProgress } from "./hosted-agent-workflow-progress.js";
 
+function modelFilter(modelIds: readonly string[] | undefined): (modelId: string) => boolean {
+  const selected = modelIds && new Set(modelIds);
+  return modelId => selected === undefined || selected.has(modelId);
+}
+
 export interface HostedAgentBackendFactory {
   readonly backendId: string;
   readonly displayName?: string;
@@ -140,10 +145,11 @@ export class HostedAgentRuntime {
         }) });
       const decorated = this.#options.decorateCatalog?.(catalog) ?? catalog;
       return create(contract.GetHostedAgentCatalogResponseSchema, { ...decorated, backends: decorated.backends.map(backend => ({ ...backend,
-        providers: backend.providers.map(provider => ({ ...provider,
-          manageableModels: provider.models,
-          modelAccess: contract.toRemoteModelAccess(this.settings.modelIds(backend.backendId, provider.providerId)),
-          models: provider.models.filter(model => this.settings.allowsModel(backend.backendId, provider.providerId, model.key?.modelId ?? "")) })) })) });
+        providers: backend.providers.map(provider => {
+          const modelIds = this.settings.modelIds(backend.backendId, provider.providerId), allowed = modelFilter(modelIds);
+          return { ...provider, manageableModels: provider.models, modelAccess: contract.toRemoteModelAccess(modelIds),
+            models: provider.models.filter(model => allowed(model.key?.modelId ?? "")) };
+        }) })) });
     },
       management: { settings: this.settings, slots: this.slots, assertProviderExists: (backendId, providerId) => {
         if (!this.#factories.get(backendId)?.providerIds().includes(providerId)) throw new HostedAgentHostError("UNAVAILABLE");
@@ -236,22 +242,27 @@ export class HostedAgentRuntime {
       assertCurrent();
       if (grouped.catalog.backendId !== backendId || grouped.catalog.providers.length !== 1 || grouped.catalog.providers[0]?.providerId !== providerId
         || !grouped.models.length || grouped.models.some(model => model.providerId !== providerId)) throw new HostedAgentHostError("UNAVAILABLE");
-      const models = grouped.models.filter(model => this.settings.allowsModel(backendId, providerId, model.modelId));
-      return { ...grouped, models, catalog: create(contract.HostedAgentBackendCatalogSchema, { ...grouped.catalog,
+      const allowed = modelFilter(this.settings.modelIds(backendId, providerId));
+      const models = grouped.models.filter(model => allowed(model.modelId));
+      const catalog = create(contract.HostedAgentBackendCatalogSchema, { ...grouped.catalog,
         providers: grouped.catalog.providers.map(provider => ({ ...provider, manageableModels: [],
-          models: provider.models.filter(model => this.settings.allowsModel(backendId, providerId, model.key?.modelId ?? "")) })) }), assertCurrent };
+          models: provider.models.filter(model => allowed(model.key?.modelId ?? "")) })) });
+      assertCurrent();
+      return { ...grouped, models, catalog, assertCurrent };
     }
     const factory = this.#factories.get(backendId); if (!factory || factory.isolatedGuests?.() !== true || !factory.providerIds().includes(providerId)) throw new HostedAgentHostError("UNAVAILABLE");
     const assertComputer = this.settings.captureComputer(), assertProvider = this.settings.captureProvider(backendId, providerId);
     const assertCurrent = () => { assertComputer(); assertProvider(); if (factory.isolatedGuests?.() !== true || !factory.providerIds().includes(providerId)) throw new HostedAgentHostError("UNAVAILABLE"); };
     assertCurrent(); const available = factory.models().filter(model => model.providerId === providerId);
     if (!available.length) throw new HostedAgentHostError("UNAVAILABLE");
-    const models = available.filter(model => this.settings.allowsModel(backendId, providerId, model.modelId));
+    const allowed = modelFilter(this.settings.modelIds(backendId, providerId));
+    const models = available.filter(model => allowed(model.modelId));
     const descriptor = factory.describe?.(), provider = descriptor?.providers?.find(item => item.providerId === providerId);
     const catalog = create(contract.HostedAgentBackendCatalogSchema, { backendId, instanceGeneration: BigInt(this.#options.store.getBackend(backendId).descriptor.instanceGeneration), displayName: factory.displayName ?? backendId, nativeAdapterKind: descriptor?.adapterKind ?? "", nodeId: this.#options.nodeId ?? "",
       version: factory.version?.() ?? "", capabilities: [...(factory.capabilities?.().values() ?? [])].map(toProtoCapability), maxRuns: this.settings.limits().perDevice,
       providers: [{ providerId, displayName: providerId, accessKind: provider?.accessKind ?? "", accessProduct: provider?.accessProduct ?? "",
         remoteInvocationEnabled: true, connected: true, models: models.map(model => toProtoModelDescriptor(backendId, model)) }] });
+    assertCurrent();
     return { models, catalog, assertCurrent };
   }
   availableRemoteModels(backendId: string, providerId: string): readonly contract.ModelDescriptor[] {

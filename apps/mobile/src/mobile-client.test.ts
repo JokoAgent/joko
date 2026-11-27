@@ -7829,6 +7829,49 @@ describe("native mobile connection and operation ownership", () => {
     expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
   });
 
+  it("creates through the original group's owner and sends the first input on the Backend returned by that operation", async () => {
+    const routed = create(SessionSchema, { ...runtimeSession, backendId: "group-member", nativeBinding: { ...runtimeSession.nativeBinding!, backendId: "group-member" } });
+    const base = runtimeControlProjection(routed);
+    const owner = create(SnapshotSchema, { ...base, targets: automationAuthoringOwnerSnapshot.targets, workspaces: automationAuthoringOwnerSnapshot.workspaces,
+      settings: { ...base.settings!, taskModelGroupsAvailable: true }, backends: [...base.backends, { ...attachmentSnapshot.backends[0]!, backendId: routed.backendId }],
+      providers: [...base.providers, { ...runtimeProviders[0]!, backendId: routed.backendId }],
+      models: [...base.models, { ...runtimeModels[0]!, backendId: routed.backendId, inputModalities: [ModelInputModality.TEXT, ModelInputModality.IMAGE] }] });
+    const network = projectedNetwork(owner), drafts = memoryDraftStores();
+    network.readSession = vi.fn(async () => create(SnapshotSchema, { ...runtimeControlProjection(routed, true),
+      backends: [owner.backends[1]!], targets: owner.targets, workspaces: owner.workspaces }));
+    network.listTaskModelGroups = vi.fn(async () => ({ revision: "4", groups: [{ id: "work", name: "Work" }] }));
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: mutation.payload.case === "createSession" ? { case: "session", value: routed }
+        : { case: "queueItem", value: { queueItemId: "first", sessionId: routed.sessionId, targetId: routed.targetId,
+          backendId: routed.backendId, state: QueueItemState.ACCEPTED } } }
+    }));
+    let sequence = 0;
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => `group-task-${++sequence}`, undefined, drafts);
+    await app.start();
+    const group = { targetId: "target", serverId: credential.serverId, groupId: "work", revision: "4" };
+    const send = (serverId: string) => app.create("target", "Work", plainTextMobileComposerDraft("hello"), undefined, undefined, undefined, undefined, { ...group, serverId });
+    await expect(send("other-node")).rejects.toThrow("current node");
+    drafts.newTask.save({ profileId: credential.profileId }, { name: "Work", targetId: group.targetId, input: plainTextMobileComposerDraft("hello"), taskModelGroup: group });
+    network.previewTaskModelGroup = vi.fn(async () => ({ backendId: routed.backendId, providerId: "alpha", modelId: "a", supportsImages: true }));
+    expect(app.newTaskAttachmentControls(group.targetId)).toBeUndefined();
+    await app.refreshNewTaskGroupMedia(group, new AbortController().signal);
+    expect(app.newTaskAttachmentControls(group.targetId)?.policy).toMatchObject({ images: true, imageMediaTypes: ["image/png"] });
+    vi.mocked(network.previewTaskModelGroup).mockResolvedValueOnce(undefined);
+    await expect(app.create("target", "Work", localAttachmentDraft("photo"), undefined, undefined, undefined, undefined, group)).rejects.toThrow("attachments");
+    expect(network.previewTaskModelGroup).toHaveBeenCalledWith(credential, { groupId: "work", revision: "4" }, true, expect.any(AbortSignal));
+    expect(network.submit).not.toHaveBeenCalled();
+    await expect(send(group.serverId)).resolves.toEqual({ created: true, sent: true, definitive: true, sessionId: routed.sessionId });
+    const [start, first] = vi.mocked(network.submit).mock.calls;
+    expect(start?.[2].payload).toMatchObject({ case: "createSession", value: { backendId: "backend", targetId: "target",
+      taskModelGroup: { groupId: "work", expectedRevision: 4n, hasImages: false } } });
+    expect(start?.[2].payload.case === "createSession" && start[2].payload.value.model).toBeUndefined();
+    expect(first?.[2]).toMatchObject({ preconditions: [{ entity: { id: routed.sessionId }, expectedGeneration: 8n }],
+      payload: { case: "sendInput", value: { sessionId: routed.sessionId } } });
+    expect(app.taskAttachmentControls()?.policy).toMatchObject({ images: true, files: true });
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+  });
+
   it.each([false, true])("creates an objective task without sending the composer and retains the complete form on failure=%s", async fails => {
     const network = fakeNetwork(), drafts = memoryDraftStores();
     let operation = 0;
@@ -12812,10 +12855,13 @@ describe("native current-task runtime controls", () => {
     const sourceBackend = create(BackendDescriptorSchema, { ...runtimeBackend, backendId: "opaque-source" });
     const sourceModel = create(ModelDescriptorSchema, { ...runtimeModels[1]!, backendId: "opaque-source", source: create(ModelSourceDescriptorSchema, {
       kind: ModelSourceKind.DEVICE, displayName: "Account", nodeName: "Studio", nativeAdapterKind: "native" }) });
-    const owner = create(SnapshotSchema, { ...runtimeControlProjection(), backends: [runtimeBackend, sourceBackend],
+    const base = runtimeControlProjection();
+    const owner = create(SnapshotSchema, { ...base, targets: automationAuthoringOwnerSnapshot.targets, workspaces: automationAuthoringOwnerSnapshot.workspaces,
+      settings: { ...base.settings!, taskModelGroupsAvailable: true }, backends: [runtimeBackend, sourceBackend],
       models: [...runtimeModels, sourceModel], providers: [...runtimeProviders, { ...runtimeProviders[1]!, backendId: "opaque-source" }] });
+    network.listTaskModelGroups = vi.fn(async () => ({ revision: "4", groups: [{ id: "work", name: "Work" }] }));
     network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
-    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.readSession = vi.fn(async () => create(SnapshotSchema, { ...runtimeControlProjection(runtimeSession, true), targets: owner.targets, workspaces: owner.workspaces }));
     network.getSessionRuntimeControl = vi.fn(async () => create(TaskShareRuntimeControlSchema, { generation: 23n }));
     const app = client(network, saved.storage); await app.start();
     const controls = app.taskRuntimeControls()!;
@@ -12827,6 +12873,21 @@ describe("native current-task runtime controls", () => {
     network.getSessionRuntimeControl = vi.fn(async () => create(TaskShareRuntimeControlSchema, { generation: 24n, handoffState: "unknown" }));
     await expect(app.setTaskModel(app.taskRuntimeControls()!.authorityKey, { backendId: "opaque-source", providerId: "beta", modelId: "b", effortId: "medium", fastMode: false })).rejects.toThrow("Recover");
     expect(network.submit).toHaveBeenCalledOnce();
+    const group = { groupId: "work", revision: "4" };
+    await expect(app.setTaskModelGroup(app.taskRuntimeControls()!.authorityKey, group)).rejects.toThrow("route changed");
+    expect(network.submit).toHaveBeenCalledOnce();
+    network.getSessionRuntimeControl = vi.fn(async () => create(TaskShareRuntimeControlSchema, { generation: 25n, taskModelGroupSelectionAvailable: true }));
+    const catalog = app.taskModelGroupTransport("target")!;
+    expect(await catalog.list(new AbortController().signal)).toEqual({ revision: "4", groups: [{ id: "work", name: "Work" }] });
+    await expect(app.setTaskModelGroup(app.taskRuntimeControls()!.authorityKey, group)).resolves.toBe(true);
+    expect(vi.mocked(network.submit).mock.calls[1]?.[2]).toMatchObject({
+      preconditions: [{ entity: { id: "session" }, expectedGeneration: 8n }],
+      payload: { case: "setSessionRuntime", value: { sessionId: "session", expectedRuntimeGeneration: 25n, taskModelGroupSessionGeneration: 8n,
+        taskModelGroup: { groupId: "work", expectedRevision: 4n } } }
+    });
+    app.setForeground(false);
+    expect(app.taskModelGroupTransport("target")).toBeUndefined();
+    await expect(catalog.list(new AbortController().signal)).rejects.toThrow("owner changed");
   });
 
   it.each(["sshHost", "devicePeer"] as const)("keeps the original %s project and resolves exact remote authority when changing a new-task engine", async kind => {

@@ -155,6 +155,8 @@ message ProviderGroupMember {
   string key = 1; ProviderGroupMemberKind kind = 2; string backend_id = 3; string provider_id = 4;
   string node_id = 5; string display_name = 6; uint32 capacity = 7; uint32 weight = 8; bool paused = 9;
   ProviderGroupReceivedIdentity received = 10; string native_backend_id = 11;
+  // With the legacy capacity of 4, true removes the group-level limit.
+  optional bool unlimited_capacity = 12;
 }
 message ProviderGroupConfig { ProviderGroupStrategy strategy = 1; bool auto_switch = 2; repeated ProviderGroupMember members = 3; }
 message ProviderGroupSnapshot { ProviderGroupKey key = 1; uint64 revision = 2; ProviderGroupConfig config = 3; }

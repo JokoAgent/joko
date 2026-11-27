@@ -25508,8 +25508,8 @@ function scheduleExecutionSnapshot(
   }
   const model = input.model?.model;
   if (input.taskModelGroupId !== undefined && (input.executionMode === contract.ScheduleExecutionMode.SCRIPT
-    || !model || !input.taskModelGroupId.trim() || input.taskModelGroupId.trim() !== input.taskModelGroupId || input.taskModelGroupId.length > 96)) {
-    throw invalidArgument("A Schedule model group requires an agent, a group ID and a saved model.");
+    || !input.taskModelGroupId.trim() || input.taskModelGroupId.trim() !== input.taskModelGroupId || input.taskModelGroupId.length > 96)) {
+    throw invalidArgument("A Schedule model group requires agent execution and a valid group ID.");
   }
   if (model !== undefined && (model.providerId.trim() === "" || model.modelId.trim() === "")) {
     throw invalidArgument("schedule.execution.model requires both provider_id and model_id");

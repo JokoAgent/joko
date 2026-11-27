@@ -550,6 +550,23 @@ describe("MobileAutomationsScreen", () => {
     }), projectSchedule.scheduleId);
   });
 
+  it("shows an existing model group and clears it when the owner explicitly chooses Backend default", async () => {
+    native.width = 900;
+    const client = mobileClient(), owner = authoringOwner();
+    for (const name of [capabilityNames.modelList, capabilityNames.modelSwitch]) {
+      owner.backends[0]!.capabilities!.capabilities.push(create(CapabilitySchema, { name, support: CapabilitySupport.SUPPORTED,
+        options: { kind: { case: "model", value: { providerAware: true, switchDuringSession: true } } } }));
+    }
+    const grouped = { ...projectSchedule, taskModelGroupId: "writers" };
+    const { container } = mount(mobileState({ detail: grouped, schedules: [grouped] }, { owner }), client);
+    act(() => button(container, "Edit").click());
+    expect(container.textContent).toContain("Model group · writers");
+    act(() => button(container, "Backend default").click());
+    expect(container.textContent).not.toContain("Model group · writers");
+    await act(async () => button(container, "Save Automation").click());
+    expect(client.saveAutomation).toHaveBeenCalledWith(expect.objectContaining({ taskModelGroupId: undefined, model: undefined }), grouped.scheduleId);
+  });
+
   it("keeps the mounted editor open while a save is in flight", async () => {
     native.width = 900;
     let resolveSave!: (value: MobileAutomationSchedule | undefined) => void;

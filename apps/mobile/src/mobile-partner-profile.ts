@@ -6,6 +6,7 @@ import type { MobileModelRoute } from "./mobile-runtime-controls";
 import { mobileModelSupportsSpeed } from "./mobile-runtime-controls";
 
 export interface MobilePartnerProfileOptions {
+  readonly modelGroups?: import("./mobile-task-model-groups").MobileTaskModelGroupCatalog;
   readonly revision: bigint;
   readonly avatarPresets: readonly string[];
   readonly defaultCapabilities?: MobilePartnerCapabilities;

@@ -13,7 +13,8 @@ import {
   type ModelDescriptor,
   type ProviderDescriptor,
   type Session,
-  type Snapshot
+  type Snapshot,
+  type Target
 } from "@joko/contracts";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { decodeModelSpeed } from "@joko/contracts";
@@ -24,6 +25,13 @@ export interface MobileRuntimeOwnerIdentity {
   readonly connectionId: string;
   readonly deviceId: string;
   readonly serverId: string;
+}
+
+export function mobileSessionMatchesTarget(session: Session, target: Target): boolean {
+  if (!target.backendId || !session.backendId || target.targetId !== session.targetId) return false;
+  const binding = session.nativeBinding;
+  if (binding?.backendId && binding.backendId !== session.backendId) return false;
+  return target.backendId === session.backendId || (binding?.backendId === session.backendId && binding.runtimeGeneration > 0n);
 }
 
 export interface MobileEffortOption {
@@ -84,6 +92,8 @@ export interface MobileRuntimeControls {
   readonly favoritesSeeded: boolean;
   readonly favoritesAvailable?: boolean;
   readonly unifiedSources?: boolean;
+  readonly taskModelGroupSelectionAvailable?: boolean;
+  readonly taskModelGroupId?: string;
   readonly pendingModel?: MobileModelRoute & MobileModelControlSelection;
 }
 
@@ -179,7 +189,7 @@ export function resolveMobileRuntimeControls(
   }
   const backend = backends[0]!;
   const ownerBackend = ownerBackends[0]!;
-  if (targets[0]!.backendId !== session.backendId || ownerTargets[0]!.backendId !== session.backendId
+  if (targets[0]!.backendId !== ownerTargets[0]!.backendId || !mobileSessionMatchesTarget(session, targets[0]!) || !mobileSessionMatchesTarget(ownerSession, ownerTargets[0]!)
     || !sameBackendAuthority(ownerBackend, backend)) return undefined;
   const backendSettings = owner.settings?.backends.filter((candidate) => candidate.backendId === session.backendId) ?? [];
   const favoriteSettings = owner.settings.modelFavorites;

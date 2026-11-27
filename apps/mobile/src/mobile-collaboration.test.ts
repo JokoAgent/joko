@@ -52,6 +52,14 @@ describe("mobile collaboration contract and local recovery", () => {
     const raw = [...values.values()][0]!; expect(raw).not.toContain("Private");
     expect(await storage.defaults("profile", [target], target.id)).toEqual(form);
     expect(await storage.defaults("other-profile", [target], target.id)).toEqual(form);
+    const model = { providerId: "provider", modelId: "chosen", fastMode: "ultrafast" } as const;
+    const route = { ...model, key: "chosen", backendId: "backend", providerName: "Provider", displayName: "Chosen", family: "",
+      contextWindowTokens: 0n, maximumOutputTokens: 0n, efforts: [], supportsFastMode: false, supportsUltrafastMode: true };
+    const catalog = { ...target, models: [route], defaultModel: { ...model, modelId: "default", fastMode: false } };
+    await storage.remember("profile", catalog, { ...form, model });
+    expect((await storage.defaults("profile", [catalog], target.id))?.model).toEqual(model);
+    expect((await storage.defaults("profile", [{ ...catalog, models: [{ ...route, supportsUltrafastMode: false }] }], target.id))?.model)
+      .toEqual({ ...model, fastMode: false });
     const identity = { profileId: "profile", connectionId: "connection", serverId: "node", sessionId: "task", generation: "7" };
     await storage.save(identity, { ...form, initialTask: "Recover this work" });
     expect(await storage.read(identity)).toMatchObject({ initialTask: "Recover this work" });

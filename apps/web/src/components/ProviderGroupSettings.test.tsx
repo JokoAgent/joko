@@ -11,9 +11,9 @@ const roots: Root[] = [];
 beforeEach(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true }); });
 afterEach(async () => { for (const root of roots.splice(0)) await act(async () => root.unmount()); document.body.replaceChildren(); Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT"); });
 const t: ProviderGroupSettingsTranslator = key => key.split(".").at(-1)!;
-function fixture(kind = contract.ProviderGroupMemberKind.LOCAL, available = true) {
+function fixture(kind = contract.ProviderGroupMemberKind.LOCAL, available = true, unlimitedCapacity?: boolean) {
   const key = { backendId: "native", providerId: "provider" }, member = create(contract.ProviderGroupMemberSchema, { key: "member", kind,
-    ...key, nativeBackendId: key.backendId, nodeId: "node", displayName: "This computer", capacity: 4, weight: 1 });
+    ...key, nativeBackendId: key.backendId, nodeId: "node", displayName: "This computer", capacity: 4, unlimitedCapacity, weight: 1 });
   let snapshot = create(contract.ProviderGroupSnapshotSchema, { key, revision: 1n, config: { strategy: contract.ProviderGroupStrategy.LEAST_BUSY, autoSwitch: true, members: [member] } });
   const get = vi.fn(async () => snapshot), update = vi.fn(async (_key: typeof key, revision: bigint, config: contract.ProviderGroupConfig | undefined) => {
     expect(revision).toBe(snapshot.revision); snapshot = create(contract.ProviderGroupSnapshotSchema, { key, revision: revision + 1n, config }); return snapshot;
@@ -80,6 +80,16 @@ it("preserves the user's draft after a CAS conflict and never retries the failed
   const capacity = container.querySelector<HTMLInputElement>('input[type="number"]')!; await input(capacity, "9"); await act(async () => button(container, "save").click());
   expect(capacity.value).toBe("9"); expect(container.textContent).toContain("conflict"); expect(f.update).toHaveBeenCalledOnce();
   await act(async () => button(container, "delete").click()); expect(f.update.mock.calls[1]![2]).toBeUndefined();
+});
+it("edits the concurrent turn limit independently of the legacy numeric value four", async () => {
+  const f = fixture(contract.ProviderGroupMemberKind.LOCAL, true, true), { container } = await mount(f);
+  const limit = [...container.querySelectorAll("select")].find(item => item.querySelector('option[value="unlimited"]'))!;
+  expect(limit.value).toBe("unlimited");
+  for (const value of ["4", "unlimited"]) {
+    await act(async () => { limit.value = value; limit.dispatchEvent(new Event("change", { bubbles: true })); });
+    await act(async () => button(container, "save").click());
+    expect(f.update.mock.calls.at(-1)?.[2]?.members[0]).toMatchObject({ capacity: 4, unlimitedCapacity: value === "unlimited" });
+  }
 });
 it("ignores an old source response after switching the authenticated owner API", async () => {
   const old = fixture(), next = fixture(); let finish!: (value: contract.ProviderGroupSnapshot) => void;

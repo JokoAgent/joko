@@ -932,6 +932,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
       ...current,
       targetId,
       backendId: target?.backendId ?? session?.backendId ?? "",
+      ...(target?.trusted && target.remoteWorkspace === undefined ? {} : { taskModelGroupId: undefined }),
       sessionId: current.sessionMode === "bound" ? session?.id ?? "" : "",
       providerId: model?.providerId ?? "",
       modelId: model?.modelId ?? "",
@@ -986,6 +987,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
             ...current,
             executionMode,
             ...(executionMode === "script" ? {
+              taskModelGroupId: undefined,
               sessionMode: current.sessionMode === "bound" ? "bound" as const : "fresh" as const,
               sessionId: current.sessionMode === "bound" ? current.sessionId : "",
               silentWhenIdle: false,
@@ -1059,7 +1061,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
         </div>}
       </fieldset>}
       {draft.executionMode === "agent" ? <label className="interaction-input"><span>{t("scheduler.scheduledInput")}</span><textarea required rows={5} value={draft.inputText} onChange={(event) => setDraft((current) => ({ ...current, inputText: event.target.value }))} placeholder={t("scheduler.inputPlaceholder")} /></label> : <label className="interaction-input"><span>{t("scheduler.scriptCommand")}</span><textarea required rows={5} spellCheck={false} value={draft.scriptCommand} onChange={(event) => setDraft((current) => ({ ...current, scriptCommand: event.target.value }))} placeholder={t("scheduler.scriptCommandPlaceholder")} /></label>}
-      {draft.executionMode === "agent" && draft.modelId && <SavedModelGroupSelect controller={controller} value={draft.taskModelGroupId}
+      {draft.executionMode === "agent" && selectedTarget?.trusted && selectedTarget.remoteWorkspace === undefined && <SavedModelGroupSelect controller={controller} value={draft.taskModelGroupId}
         disabled={saving} t={t} onChange={taskModelGroupId => setDraft(current => ({ ...current, taskModelGroupId }))} />}
       {(worktreeCompatible || draft.useWorktree) && <section className="new-task-worktree" aria-label={t("worktree.title")}>
         <header>
@@ -1106,7 +1108,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
             onOpen={() => backend === undefined ? undefined : controller.refreshProviderModels(backend.id, undefined, true).then(() => undefined, () => undefined)}
             onSelect={(selection) => {
               if (selection === undefined) {
-                setDraft((current) => ({ ...current, providerId: "", modelId: "", effort: undefined, fastMode: false }));
+                setDraft((current) => ({ ...current, taskModelGroupId: undefined, providerId: "", modelId: "", effort: undefined, fastMode: false }));
                 return;
               }
               const model = execution.availableModels.find((candidate) =>
@@ -1114,6 +1116,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
               if (model === undefined || !model.available) return;
               setDraft((current) => ({
                 ...current,
+                taskModelGroupId: undefined,
                 providerId: model.providerId,
                 modelId: model.modelId,
                 effort: execution.effortSupported && selection.effort !== undefined && model.efforts.includes(selection.effort)
@@ -1157,8 +1160,8 @@ export function scheduleDraft(schedule: ScheduleView | undefined, targets: reado
   const availableTarget = targets.find((candidate) => !candidate.archived && (backends.length === 0 || scheduleTargetAvailable(candidate, backends)));
   const target = targets.find((candidate) => candidate.id === schedule?.targetId) ?? availableTarget;
   const session = sessions.find((candidate) => candidate.id === schedule?.sessionId) ?? sessions.find((candidate) => candidate.targetId === target?.id);
-  const followTask = savedBoundTaskDefault(schedule);
-  const model = followTask ? undefined : schedule?.model ?? session?.model;
+  const inheritModel = savedBoundTaskDefault(schedule) || (schedule?.taskModelGroupId !== undefined && schedule.model === undefined);
+  const model = inheritModel ? undefined : schedule?.model ?? session?.model;
   const backendId = schedule?.backendId ?? target?.backendId ?? session?.backendId ?? "";
   const descriptor = models.find((candidate) => candidate.backendId === backendId && candidate.providerId === model?.providerId && candidate.modelId === model?.modelId);
   const timezone = schedule?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -1182,8 +1185,8 @@ export function scheduleDraft(schedule: ScheduleView | undefined, targets: reado
     scriptDispatchSessions: schedule?.script?.capabilities.includes("sessions.dispatch") ?? false,
     providerId: model?.providerId ?? "",
     modelId: model?.modelId ?? "",
-    effort: followTask ? undefined : schedule?.model?.effort ?? session?.effort ?? descriptor?.efforts[0],
-    fastMode: followTask ? false : schedule?.model?.fastMode ?? session?.fastMode ?? false,
+    effort: inheritModel ? undefined : schedule?.model?.effort ?? session?.effort ?? descriptor?.efforts[0],
+    fastMode: inheritModel ? false : schedule?.model?.fastMode ?? session?.fastMode ?? false,
     permissionMode: schedule?.permissionMode ?? session?.permissionMode ?? "ask",
     planMode: schedule?.planMode ?? session?.planMode ?? false,
     useWorktree: schedule?.useWorktree ?? false,

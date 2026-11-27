@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { assertProviderGroupConfig, groupKey, SessionRuntimeHandoffStore, type ProviderGroupConfig, type ProviderGroupKey, type ProviderGroupMember, type ProviderGroupSnapshot } from "@joko/store";
+import { assertProviderGroupConfig, groupKey, providerGroupCapacity, SessionRuntimeHandoffStore, type ProviderGroupConfig, type ProviderGroupKey, type ProviderGroupMember, type ProviderGroupSnapshot } from "@joko/store";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 import { ProviderGroupRouter, type ProviderGroupAssignment, type ProviderGroupPick } from "./provider-group-router.js";
 import { decideProviderGroupFailure, describeProviderGroupFailure, providerGroupFailureSignals, PROVIDER_GROUP_SUPERSEDED_ERROR,
@@ -233,7 +233,7 @@ export class ProviderGroupService {
     const current = statuses.find(status => status.member.key === member.key);
     if (!current || !supports(current)) return undefined; current.assertCurrent();
     const candidates = statuses.filter(status => status.member.nodeId !== member.nodeId && supports(status)
-      && !status.member.paused && this.router.leases.count(status.member.key, status.running) < status.member.capacity
+      && !status.member.paused && this.router.leases.count(status.member.key, status.running) < providerGroupCapacity(status.member)
       && !this.#rebalanceBackoff(binding.group, status.member.key));
     for (const candidate of candidates) candidate.assertCurrent();
     return { session, snapshot, current, candidates, sourceGeneration: actual.binding.generation };

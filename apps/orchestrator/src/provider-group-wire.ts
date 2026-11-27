@@ -27,7 +27,8 @@ export function fromGroupMember(value: contract.ProviderGroupMember): ProviderGr
   if (!kind) throw new Error("Invalid Provider group member kind.");
   const received = value.received;
   const member: ProviderGroupMember = { key: value.key, kind, backendId: value.backendId, nativeBackendId: value.nativeBackendId, providerId: value.providerId, nodeId: value.nodeId, displayName: value.displayName,
-    capacity: value.capacity, weight: value.weight, paused: value.paused, ...(received ? { received: { joinId: received.joinId, shareId: received.shareId, memberId: received.memberId,
+    capacity: value.capacity, ...(value.unlimitedCapacity === undefined ? {} : { unlimitedCapacity: value.capacity === 4 && value.unlimitedCapacity }),
+    weight: value.weight, paused: value.paused, ...(received ? { received: { joinId: received.joinId, shareId: received.shareId, memberId: received.memberId,
       generation: exactNumber(received.generation), hostServerId: received.hostServerId, nativeBackendId: received.nativeBackendId, providerId: received.providerId } } : {}) };
   assertProviderGroupConfig({ strategy: "ordered", autoSwitch: true, members: [member] }); return member;
 }
@@ -35,8 +36,18 @@ export function toGroupSnapshot(value: ProviderGroupSnapshot): contract.Provider
   return create(contract.ProviderGroupSnapshotSchema, { key: { backendId: value.backendId, providerId: value.providerId }, revision: value.revision,
     config: value.config === undefined ? undefined : { strategy: toGroupStrategy(value.config.strategy), autoSwitch: value.config.autoSwitch, members: value.config.members.map(toGroupMember) } });
 }
-export function fromGroupConfig(value: contract.ProviderGroupConfig): ProviderGroupConfig {
-  const config = { strategy: fromGroupStrategy(value.strategy), autoSwitch: value.autoSwitch, members: value.members.map(fromGroupMember) }; assertProviderGroupConfig(config); return config;
+export function fromGroupConfig(value: contract.ProviderGroupConfig, previous?: ProviderGroupConfig): ProviderGroupConfig {
+  const members = value.members.map(wire => {
+    const member = fromGroupMember(wire);
+    // An older editor sends the compatibility value back on unrelated changes.
+    if (member.capacity === 4 && member.unlimitedCapacity === undefined && previous?.members.some(old => old.key === member.key && old.unlimitedCapacity)) {
+      return { ...member, unlimitedCapacity: true };
+    }
+    return member;
+  });
+  const config = { strategy: fromGroupStrategy(value.strategy), autoSwitch: value.autoSwitch, members };
+  assertProviderGroupConfig(config);
+  return config;
 }
 export function fromGroupKey(value: contract.ProviderGroupKey | undefined): ProviderGroupKey {
   if (!value || !identity(value.backendId) || !identity(value.providerId)) throw new Error("Invalid Provider group identity."); return { backendId: value.backendId, providerId: value.providerId };

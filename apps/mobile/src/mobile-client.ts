@@ -25,6 +25,8 @@ import { mobileTaskSharingApi, mobileJoinedTaskNetwork, assertMobileSharedTaskSn
   type MobileJoinedTaskSource, type MobileTaskSource } from "./mobile-task-sharing";
 import { resolveMobileSharedRuntimeControls } from "./mobile-runtime-controls";
 import { MobileNewTaskModelMemory, type MobileNewTaskSourceSelection } from "./mobile-new-task-model-memory";
+import { mobileTaskModelGroupChoice, type MobileTaskModelGroupChoice, type MobileTaskModelGroupMedia, type MobileTaskModelGroupTransport } from "./mobile-task-model-groups";
+import type { MobileNewTaskGroup } from "./new-task-draft-store";
 import { sameMobileModelSourceProject } from "./mobile-model-source-project";
 import { CreateRemoteTargetMutationSchema, CreateDevicePeerTargetMutationSchema } from "@joko/contracts";
 import { resolveMobileSharedContextControls } from "./mobile-context-controls";
@@ -359,6 +361,7 @@ import {
   assertMobileModelFavoriteMutation,
   assertMobilePermissionMode,
   assertMobilePlanMode,
+  mobileSessionMatchesTarget,
   resolveMobileExplicitNewTaskModelAuthority,
   resolveMobileNewTaskDefaultModelAuthority,
   resolveMobileNewTaskExecutionAuthority,
@@ -1168,6 +1171,7 @@ export class MobileClient {
   #partnerPrivateSourceTargetId?: string;
   #partnerCreationFlight?: { readonly ownerKey: string; readonly token: symbol };
   #newTaskModelMemory?: MobileNewTaskModelMemory;
+  #newTaskGroupMedia?: { ownerKey: string; groupId: string; revision: string; route?: MobileTaskModelGroupMedia };
   #runtimeModelSelection?: { readonly ownerKey: string; readonly control: TaskShareRuntimeControl };
   #partnerCreationKnown?: { readonly ownerKey: string; readonly requestId: string };
   #partnerPrivateResume?: {
@@ -10663,6 +10667,38 @@ export class MobileClient {
       sources: sources.map(source => ({ ...source })) };
   }
 
+  taskModelGroupTransport(targetId: string): MobileTaskModelGroupTransport | undefined {
+    const key = this.#newTaskAuthorityKey(targetId), owner = this.#state.owner, credential = this.#credential;
+    const target = owner?.targets.find(row => row.targetId === targetId);
+    const workspace = owner?.workspaces.find(row => row.workspaceId === target?.workspaceId && row.targetId === targetId);
+    if (!key || !credential || this.#joinedTask || owner?.scope?.kind.case !== "owner" || !owner.settings?.taskModelGroupsAvailable || !workspace?.trusted
+      || target?.location?.kind.case !== "serviceNode" || !this.network.listTaskModelGroups) return undefined;
+    const ownerKey = JSON.stringify([key, this.#epoch]);
+    const assertCurrent = (signal: AbortSignal) => {
+      signal.throwIfAborted();
+      if (this.#credential !== credential || this.taskModelGroupTransport(targetId)?.ownerKey !== ownerKey) throw new Error("The task model group owner changed.");
+    };
+    return { ownerKey, list: async (signal: AbortSignal) => {
+      assertCurrent(signal);
+      const catalog = await this.network.listTaskModelGroups!(credential, signal);
+      assertCurrent(signal);
+      return catalog;
+    }, preview: async (choice: MobileTaskModelGroupChoice, hasImages: boolean, signal: AbortSignal) => {
+      assertCurrent(signal);
+      const route = await this.network.previewTaskModelGroup?.(credential, mobileTaskModelGroupChoice(choice), hasImages, signal);
+      assertCurrent(signal);
+      return route;
+    } };
+  }
+
+  async refreshNewTaskGroupMedia(choice: MobileNewTaskGroup, signal: AbortSignal): Promise<void> {
+    const transport = this.taskModelGroupTransport(choice.targetId);
+    if (!transport || choice.serverId !== this.#credential?.serverId) return;
+    const route = await transport.preview(choice, true, signal);
+    this.#newTaskGroupMedia = { ownerKey: transport.ownerKey, groupId: choice.groupId, revision: choice.revision, route };
+    this.#set({});
+  }
+
   newTaskModels(targetId: string) {
     if (!this.#newTaskAuthorityKey(targetId)) return [];
     const owner = this.#state.owner;
@@ -10792,7 +10828,7 @@ export class MobileClient {
   }
 
   async create(targetId: string, name: string, firstInput: MobileComposerDraft, objective?: MobileObjectiveInput, collaboration?: MobileWorkerForm,
-    uploadObserver?: MobileNewTaskUploadObserver, worktree?: MobileNewTaskWorktree): Promise<MobileNewTaskResult> {
+    uploadObserver?: MobileNewTaskUploadObserver, worktree?: MobileNewTaskWorktree, taskModelGroup?: MobileNewTaskGroup): Promise<MobileNewTaskResult> {
     const input = normalizeMobileComposerDraft(firstInput);
     const worktreeInput = worktree === undefined ? undefined : normalizeMobileNewTaskWorktree(worktree);
     const objectiveInput = objective === undefined ? undefined : normalizeMobileObjectiveInput(objective);
@@ -10821,6 +10857,8 @@ export class MobileClient {
     }
     const credential = this.#ready();
     const node = this.#state.node;
+    if (taskModelGroup && (taskModelGroup.targetId !== targetId || taskModelGroup.serverId !== credential.serverId
+      || !this.taskModelGroupTransport(targetId))) throw new Error("Select a model group on the current node and project.");
     if (!node || node.serverId !== credential.serverId || this.#activeProfileId !== credential.profileId) {
       throw new Error("Reconnect to the exact saved Joko node before creating a task.");
     }
@@ -10830,7 +10868,7 @@ export class MobileClient {
     const receivingModel = resolveMobileExplicitNewTaskModelAuthority(owner, backend.backendId, this.newTaskModelSelection(targetId))
       ?? resolveMobileNewTaskDefaultModelAuthority(owner, backend.backendId);
     const attachmentControls = this.newTaskAttachmentControls(targetId);
-    if (objectiveInput === undefined && input.attachments.length > 0) {
+    if (!taskModelGroup && objectiveInput === undefined && input.attachments.length > 0) {
       if (!attachmentControls) throw new Error("This Backend does not accept attachments for a new task.");
       assertMobileAttachmentPolicy(input.attachments, attachmentControls.policy);
     }
@@ -10846,13 +10884,14 @@ export class MobileClient {
     this.#newTaskUploadObserver = uploadObserver;
     try {
       const submission = await this.newTaskDrafts.beginSubmission(identity, { targetId, name, input,
+        ...(taskModelGroup ? { taskModelGroup } : {}),
         ...(worktreeInput === undefined ? {} : { worktree: worktreeInput }), ...(workerForm ? { collaboration: workerForm } : {}) }, {
         connectionId: credential.connectionId,
         serverId: credential.serverId,
         backendId: target.backendId,
         targetRevision: targetRevision.value.toString(10),
         ...(targetRevision.etag === "" ? {} : { targetRevisionEtag: targetRevision.etag }),
-        model: receivingModel?.selection ?? null,
+        model: taskModelGroup ? null : receivingModel?.selection ?? null,
         ...(objectiveInput === undefined ? {} : { objective: objectiveInput }),
         ...(workerForm === undefined ? {} : { collaboration: workerForm }),
         createOperationId
@@ -10908,7 +10947,9 @@ export class MobileClient {
         nativeStart: create(NativeSessionStartSchema, {
           kind: { case: "newSession", value: create(NewNativeSessionSchema, { parentNativeReference: "" }) }
         }),
-        ...(submission.model === null ? {} : {
+        ...(submission.taskModelGroup ? { taskModelGroup: { groupId: submission.taskModelGroup.groupId,
+          expectedRevision: BigInt(submission.taskModelGroup.revision), hasImages: submission.input.attachments.some(attachment => attachment.kind === "image") } } : {}),
+        ...(submission.model === null || submission.taskModelGroup ? {} : {
           model: create(ModelSelectionSchema, {
             model: create(ModelKeySchema, {
               providerId: submission.model.providerId,
@@ -10930,16 +10971,20 @@ export class MobileClient {
   #assertNewTaskCreateAuthority(submission: MobileNewTaskSubmission, owner = this.#state.owner): void {
     const credential = this.#ready();
     const target = uniqueValue(owner?.targets ?? [], (candidate) => candidate.targetId === submission.targetId);
-    const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === submission.backendId);
+    const runtimeBackend = submission.phase === "sending" ? submission.adoptedBackendId ?? submission.backendId : submission.backendId;
+    const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === runtimeBackend);
     const model = submission.model === null
       ? undefined
-      : resolveMobileExplicitNewTaskModelAuthority(owner, submission.backendId, submission.model);
+      : resolveMobileExplicitNewTaskModelAuthority(owner, runtimeBackend, submission.model);
     const revision = target?.version?.revision;
     if (credential.connectionId !== submission.connectionId || credential.serverId !== submission.serverId
       || this.#activeProfileId !== credential.profileId || this.#state.node?.serverId !== submission.serverId
       || !target || target.backendId !== submission.backendId || target.state !== TargetState.ACTIVE
       || !revision || revision.value.toString(10) !== submission.targetRevision
       || (revision.etag || undefined) !== submission.targetRevisionEtag
+      || submission.taskModelGroup && submission.phase === "creating" && (!owner?.settings?.taskModelGroupsAvailable
+        || target.location?.kind.case !== "serviceNode" || !owner.workspaces.some(workspace =>
+          workspace.workspaceId === target.workspaceId && workspace.targetId === target.targetId && workspace.trusted))
       || !backend || !supportsText(backend) || submission.model !== null && !model
       || submission.worktree !== undefined && !this.newTaskWorktreeOwnerKey(submission.targetId)) {
       throw new Error("The project or Backend changed while this task was being prepared. Review the retained draft and try again.");
@@ -10972,12 +11017,16 @@ export class MobileClient {
       return { created: true, sent: false, definitive: true };
     }
     const generation = session.nativeBinding!.runtimeGeneration;
+    const selected = session.model?.model;
+    const adopted = submission.taskModelGroup && selected && session.model ? { backendId: session.backendId, model: {
+      providerId: selected.providerId, modelId: selected.modelId, ...(session.model.effortId ? { effortId: session.model.effortId } : {}),
+      fastMode: decodeModelSpeed(session.model) } } : undefined;
     const epoch = this.#epoch;
     const sending = await this.newTaskDrafts.advanceToSending(
       identity,
       submission.createOperationId,
       session.sessionId,
-      generation
+      generation, adopted
     );
     const deferred = { sessionId: sending.sessionId, created: true, sent: false, definitive: false };
     if (!this.#current(epoch)) return deferred;
@@ -11072,7 +11121,10 @@ export class MobileClient {
     const session = operation.result?.payload.case === "session" ? operation.result.payload.value : undefined;
     const generation = session?.nativeBinding?.runtimeGeneration;
     if (operation.state !== OperationState.SUCCEEDED || operation.operationId !== submission.createOperationId || operation.connectionId !== submission.connectionId
-      || !session || !session.sessionId || session.backendId !== submission.backendId || session.targetId !== submission.targetId
+      || !session || !session.sessionId || session.targetId !== submission.targetId
+      || (submission.taskModelGroup ? !session.backendId || !session.model?.model?.providerId || !session.model.model.modelId
+        || session.backendId !== submission.backendId && session.nativeBinding?.backendId !== session.backendId
+        || submission.phase === "sending" && session.backendId !== submission.adoptedBackendId : session.backendId !== submission.backendId)
       || !generation || generation < 1n) return undefined;
     return session;
   }
@@ -11162,12 +11214,13 @@ export class MobileClient {
       return { status: "deferred", message: "The task was created. Its first message is retained until the authoritative task detail is synchronized." };
     }
     const target = this.#state.owner.targets.find((candidate) => candidate.targetId === submission.targetId);
-    const backend = this.#state.owner.backends.find((candidate) => candidate.backendId === submission.backendId);
+    const runtimeBackend = submission.adoptedBackendId ?? submission.backendId;
+    const backend = this.#state.owner.backends.find((candidate) => candidate.backendId === runtimeBackend);
     const generation = session.nativeBinding?.runtimeGeneration;
     const detailGeneration = detailSession.nativeBinding?.runtimeGeneration;
-    if (session.backendId !== submission.backendId || session.targetId !== submission.targetId
-      || detailSession.backendId !== submission.backendId || detailSession.targetId !== submission.targetId
-      || !target
+    if (session.backendId !== runtimeBackend || session.targetId !== submission.targetId
+      || detailSession.backendId !== runtimeBackend || detailSession.targetId !== submission.targetId
+      || !target || !mobileSessionMatchesTarget(session, target) || !mobileSessionMatchesTarget(detailSession, target)
       || target.backendId !== submission.backendId || !backend || !supportsText(backend)
       || !generation || !detailGeneration || generation !== detailGeneration
       || generation.toString(10) !== submission.runtimeGeneration
@@ -11327,7 +11380,7 @@ export class MobileClient {
     const queued = exactOperation && result.operation.result?.payload.case === "queueItem"
       ? result.operation.result.payload.value
       : undefined;
-    if (!queued || queued.sessionId !== submission.sessionId || queued.backendId !== submission.backendId
+    if (!queued || queued.sessionId !== submission.sessionId || queued.backendId !== (submission.adoptedBackendId ?? submission.backendId)
       || queued.targetId !== submission.targetId) {
       await this.#releaseNewTaskConversation(identity, submission, true);
       this.#set({ error: "The first-message operation returned an invalid queue result. The text remains in the task composer; verify the task before sending again." });
@@ -11414,7 +11467,7 @@ export class MobileClient {
       const operation = receipt.operation, queued = operation?.result?.payload.case === "queueItem" ? operation.result.payload.value : undefined;
       if (!receipt.accepted || operation?.state !== OperationState.SUCCEEDED || operation.operationId !== followUp.operationId
         || operation.connectionId !== submission.connectionId || !queued || queued.sessionId !== submission.sessionId
-        || queued.backendId !== submission.backendId || queued.targetId !== submission.targetId) {
+        || queued.backendId !== (submission.adoptedBackendId ?? submission.backendId) || queued.targetId !== submission.targetId) {
         await this.#releaseNewTaskConversation(identity, submission, false);
         this.#set({ error: "The follow-up was not confirmed. Its structured input remains in the created task composer for review." });
         return result(true, false);
@@ -12484,9 +12537,11 @@ export class MobileClient {
         canSetPermission: false, canSetPlanMode: false }
       : resolved;
     const runtimeSelection = this.#runtimeModelSelection;
-    const pending = runtimeSelection && runtimeSelection.ownerKey === this.#taskAuthorityKey() ? runtimeSelection.control.pending : undefined;
+    const runtime = runtimeSelection?.ownerKey === this.#taskAuthorityKey() ? runtimeSelection?.control : undefined;
+    const pending = runtime?.pending;
     const route = pending ? controls.models.find(route => route.backendId === pending.backendId && route.providerId === pending.providerId && route.modelId === pending.modelId) : undefined;
-    return route && pending ? { ...controls, pendingModel: { ...route, effortId: pending.effort, fastMode: decodeModelSpeed(pending) } } : controls;
+    return { ...controls, taskModelGroupSelectionAvailable: runtime?.taskModelGroupSelectionAvailable, taskModelGroupId: runtime?.taskModelGroupId,
+      ...(route && pending ? { pendingModel: { ...route, effortId: pending.effort, fastMode: decodeModelSpeed(pending) } } : {}) };
   }
 
   async refreshTaskRuntimeSelection(): Promise<boolean> {
@@ -12596,6 +12651,14 @@ export class MobileClient {
     const authorityKey = this.#newTaskAuthorityKey(targetId);
     const credential = this.#credential;
     const target = uniqueValue(owner?.targets ?? [], (candidate) => candidate.targetId === targetId);
+    const group = credential && this.newTaskDrafts?.readTaskModelGroup({ profileId: credential.profileId });
+    if (group?.targetId === targetId) {
+      const media = this.#newTaskGroupMedia;
+      if (!credential || group.serverId !== credential.serverId || !media || media.ownerKey !== this.taskModelGroupTransport(targetId)?.ownerKey
+        || media.groupId !== group.groupId || media.revision !== group.revision || !media.route) return undefined;
+      const policy = resolveMobileAttachmentPolicy(owner?.backends.find(item => item.backendId === media.route!.backendId), media.route.supportsImages);
+      return policy ? { profileId: credential.profileId, surfaceOwnerKey: JSON.stringify(media), policy } : undefined;
+    }
     const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === target?.backendId);
     const model = resolveMobileExplicitNewTaskModelAuthority(owner, backend?.backendId, this.newTaskModelSelection(targetId))
       ?? resolveMobileNewTaskDefaultModelAuthority(owner, backend?.backendId);
@@ -13965,6 +14028,29 @@ export class MobileClient {
       this.#workspaceMentionContext(expectedSurfaceOwnerKey).controls,
       current
     );
+  }
+
+  async setTaskModelGroup(authorityKey: string, choice: MobileTaskModelGroupChoice): Promise<boolean> {
+    const group = mobileTaskModelGroupChoice(choice);
+    const controls = this.#runtimeControlContext(authorityKey), credential = this.#ready();
+    const catalog = this.taskModelGroupTransport(controls.session.targetId), generation = controls.session.nativeBinding?.runtimeGeneration;
+    if (this.#joinedTask || !controls.canSwitchModel || !controls.unifiedSources || !generation || !catalog || !this.network.getSessionRuntimeControl) throw new Error("This task cannot change model groups.");
+    this.#assertNoPendingRuntimeControl(controls.session.sessionId);
+    const action = this.#claimMutation();
+    try {
+      const runtime = await this.network.getSessionRuntimeControl(credential, controls.session.sessionId, this.#abort?.signal);
+      this.#runtimeControlContext(authorityKey);
+      if (!runtime.taskModelGroupSelectionAvailable || this.taskModelGroupTransport(controls.session.targetId)?.ownerKey !== catalog.ownerKey) throw new Error("The task model group route changed. Reopen the model settings.");
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [this.#sessionRuntimePrecondition(controls.session)],
+        payload: { case: "setSessionRuntime", value: create(SetSessionRuntimeMutationSchema, {
+          sessionId: controls.session.sessionId, expectedRuntimeGeneration: runtime.generation, taskModelGroupSessionGeneration: generation,
+          taskModelGroup: { groupId: group.groupId, expectedRevision: BigInt(group.revision), hasImages: false }
+        }) }
+      }), { kind: "session-model", sessionId: controls.session.sessionId });
+      if (result.accepted && result.definitive) await this.refreshTaskRuntimeSelection().catch(() => undefined);
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
   }
 
   async setTaskModel(authorityKey: string, selection: MobileModelControlSelection): Promise<boolean> {
@@ -15976,7 +16062,10 @@ export class MobileClient {
     const hasSessionMentions = input.mentions.some((mention) => mention.kind === "session");
     const hasWorkspaceMentions = input.mentions.some((mention) => mention.kind === "workspace");
     const workspacePathAtoms = mobileComposerWorkspacePathAtoms(input);
-    const initialAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission);
+    const preview = input.attachments.length && submission.taskModelGroup && submission.phase === "creating"
+      ? await this.taskModelGroupTransport(submission.targetId)?.preview(submission.taskModelGroup, input.attachments.some(item => item.kind === "image"), this.#abort!.signal)
+      : undefined;
+    const initialAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission, this.#state.owner, preview);
     if (input.attachments.length > 0) {
       if (!initialAttachmentPolicy) throw new Error("This Backend no longer accepts the retained attachments.");
       assertMobileAttachmentPolicy(input.attachments, initialAttachmentPolicy);
@@ -16002,7 +16091,7 @@ export class MobileClient {
       fresh.snapshot,
       submission.targetId
     );
-    const freshAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission, fresh.snapshot);
+    const freshAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission, fresh.snapshot, preview);
     if (input.attachments.length > 0) {
       if (!freshAttachmentPolicy) throw new Error("This Backend no longer accepts the retained attachments.");
       assertMobileAttachmentPolicy(input.attachments, freshAttachmentPolicy);
@@ -16047,7 +16136,7 @@ export class MobileClient {
       finalOwner.snapshot,
       submission.targetId
     );
-    const finalAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission, finalOwner.snapshot);
+    const finalAttachmentPolicy = this.#newTaskSubmissionAttachmentPolicy(submission, finalOwner.snapshot, preview);
     if (finalAuthorityKey !== freshAuthorityKey
       || hasSessionMentions && finalSessionControls?.surfaceOwnerKey !== sessionControls?.surfaceOwnerKey
       || hasWorkspaceMentions && finalWorkspaceControls?.surfaceOwnerKey !== workspaceControls?.surfaceOwnerKey
@@ -16069,14 +16158,19 @@ export class MobileClient {
 
   #newTaskSubmissionAttachmentPolicy(
     submission: MobileNewTaskSubmission,
-    owner = this.#state.owner
+    owner = this.#state.owner,
+    preview?: MobileTaskModelGroupMedia
   ) {
+    if (submission.taskModelGroup && submission.phase === "creating") {
+      return preview && resolveMobileAttachmentPolicy(owner?.backends.find(item => item.backendId === preview.backendId), preview.supportsImages);
+    }
     const target = uniqueValue(owner?.targets ?? [], (candidate) => candidate.targetId === submission.targetId);
-    const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === submission.backendId);
+    const runtimeBackend = submission.phase === "sending" ? submission.adoptedBackendId ?? submission.backendId : submission.backendId;
+    const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === runtimeBackend);
     if (!target || target.backendId !== submission.backendId || !backend) return undefined;
     const model = submission.model === null
       ? undefined
-      : resolveMobileExplicitNewTaskModelAuthority(owner, submission.backendId, submission.model);
+      : resolveMobileExplicitNewTaskModelAuthority(owner, runtimeBackend, submission.model);
     if (submission.model !== null && !model) return undefined;
     return resolveMobileAttachmentPolicy(backend, model?.supportsImages === true);
   }
@@ -16387,7 +16481,7 @@ export class MobileClient {
     const detailBackend = detailBackends[0]!;
     const target = ownerTargets[0]!;
     const detailTarget = detailTargets[0]!;
-    if (target.backendId !== session.backendId || detailTarget.backendId !== session.backendId
+    if (target.backendId !== detailTarget.backendId || !mobileSessionMatchesTarget(ownerSession, target) || !mobileSessionMatchesTarget(session, detailTarget)
       || target.state !== TargetState.ACTIVE || detailTarget.state !== TargetState.ACTIVE
       || entityVersionKey(target.version) !== entityVersionKey(detailTarget.version)
       || backendAuthorityKey(backend) !== backendAuthorityKey(detailBackend)) return undefined;
@@ -16400,6 +16494,7 @@ export class MobileClient {
       session.sessionId,
       session.backendId,
       session.targetId,
+      target.backendId,
       generation.toString(10),
       entityVersionKey(session.version),
       entityVersionKey(target.version),

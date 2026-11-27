@@ -78,7 +78,7 @@ it("serves authenticated native hosting from the actual application with node-ow
       .getTaskProviderGroupUsage({ sessionId: "quota-task", generation: 7n })).rejects.toMatchObject({ code: Code.Unauthenticated });
     const candidates = (await groupApi.listProviderGroupCandidates({ key: groupKey })).candidates;
     const localMember = candidates.find(candidate => candidate.member?.nodeId === application!.serverId)?.member;
-    expect(localMember).toMatchObject({ backendId: "pi", providerId: "host-provider", capacity: 4 });
+    expect(localMember).toMatchObject({ backendId: "pi", providerId: "host-provider", capacity: 4, unlimitedCapacity: true });
     const group = (await groupApi.updateProviderGroup({ key: groupKey, expectedRevision: 0n,
       update: { case: "config", value: { strategy: ProviderGroupStrategy.LEAST_BUSY, autoSwitch: true, members: [localMember!] } } })).group!;
     expect((await generated.getHostedAgentCatalog({ format: 1 })).backends.find(backend => backend.backendId === "pi")?.providers

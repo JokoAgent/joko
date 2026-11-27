@@ -4419,17 +4419,19 @@ export class SessionHost {
     const savedOverrides = scheduleTurnOverrides(input.schedule.executionSnapshot);
     let overrides = savedOverrides;
     const snapshot = input.schedule.executionSnapshot;
-    const useCurrentGroupModel = isRecord(snapshot) && typeof snapshot["taskModelGroupId"] === "string"
-      && this.#providerGroups?.taskModels.savedSelection(snapshot["taskModelGroupId"]) !== undefined;
+    const groupId = isRecord(snapshot) && typeof snapshot["taskModelGroupId"] === "string" ? snapshot["taskModelGroupId"] : undefined;
+    const groupTarget = groupId === undefined ? undefined : this.#store.getTarget(session.targetId).descriptor;
+    const useCurrentGroupModel = groupId !== undefined && groupTarget?.trusted && groupTarget.remoteWorkspace === undefined
+      && session.remoteWorkspace === undefined && this.#providerGroups?.taskModels.savedSelection(groupId) !== undefined;
     if (input.boundBackendId !== undefined || useCurrentGroupModel) {
-      if (input.boundBackendId !== undefined && session.backendId !== input.boundBackendId || !this.#store.scheduleMatchesSession(input.schedule, session)
-        || session.providerId === undefined || session.modelId === undefined) {
+      if (input.boundBackendId !== undefined && (session.backendId !== input.boundBackendId || !session.providerId || !session.modelId)
+        || !this.#store.scheduleMatchesSession(input.schedule, session)) {
         throw new StoreError("The Schedule lost its adopted task Backend before admission.");
       }
       overrides = {
-        ...savedOverrides,
-        providerId: session.providerId,
-        modelId: session.modelId,
+        ...(savedOverrides?.extraDirectoryIds === undefined ? {} : { extraDirectoryIds: savedOverrides.extraDirectoryIds }),
+        ...(session.providerId === undefined ? {} : { providerId: session.providerId }),
+        ...(session.modelId === undefined ? {} : { modelId: session.modelId }),
         ...(session.effort === undefined ? {} : { effort: session.effort }),
         fastMode: session.fastMode,
         permissionMode: savedOverrides?.permissionMode ?? session.permissionMode,

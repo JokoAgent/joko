@@ -1,4 +1,5 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { ListTaskModelGroupsResponseSchema, PreviewTaskModelGroupRequestSchema, PreviewTaskModelGroupResponseSchema } from "@joko/contracts";
 import { EventCursorSchema, GetProviderUsageRequestSchema, GetProviderUsageResponseSchema, JOKO_API_VERSION,
   StreamEventsRequestSchema, StreamEventsResponseSchema, UnregisterMobilePushRequestSchema, UnregisterMobilePushResponseSchema } from "@joko/contracts";
 import { ListPartnerTaskOutputsRequestSchema, ListPartnerTaskOutputsResponseSchema,
@@ -826,6 +827,15 @@ describe("mobile Partner catalog network", () => {
       const headers = { "content-type": "application/proto" };
       if (path.endsWith("/GetPartnerDirectory")) return new Response(toBinary(GetPartnerDirectoryResponseSchema,
         create(GetPartnerDirectoryResponseSchema, { directory })), { headers });
+      if (path.endsWith("/ListTaskModelGroups")) return new Response(toBinary(ListTaskModelGroupsResponseSchema,
+        create(ListTaskModelGroupsResponseSchema, { config: { revision: 7n, groups: [{ groupId: "work", name: "Work" }] } })), { headers });
+      if (path.endsWith("/PreviewTaskModelGroup")) {
+        expect(fromBinary(PreviewTaskModelGroupRequestSchema, new Uint8Array(init?.body as Uint8Array)).selection)
+          .toMatchObject({ groupId: "work", expectedRevision: 7n, hasImages: true });
+        return new Response(toBinary(PreviewTaskModelGroupResponseSchema, create(PreviewTaskModelGroupResponseSchema, {
+          selected: { available: true, supportsImages: true, source: { backendId: "remote", providerId: "exact", modelId: "vision" } }
+        })), { headers });
+      }
       expect(path).toBe("/joko.v1.PartnerService/UpdatePartner");
       const request = fromBinary(UpdatePartnerRequestSchema, new Uint8Array(init?.body as Uint8Array)); patches.push(request);
       expect(request).toMatchObject({ partnerId: "partner-a", expectedRevision: { value: 2n } });
@@ -835,7 +845,9 @@ describe("mobile Partner catalog network", () => {
       })), { headers });
     });
     try {
-      await expect(mobileNetwork.getPartnerProfileOptions!(credential)).resolves.toMatchObject({ revision: 4n });
+      await expect(mobileNetwork.getPartnerProfileOptions!(credential)).resolves.toMatchObject({ revision: 4n, modelGroups: { revision: "7", groups: [{ id: "work", name: "Work" }] } });
+      await expect(mobileNetwork.previewTaskModelGroup!(credential, { groupId: "work", revision: "7" }, true))
+        .resolves.toEqual({ backendId: "remote", providerId: "exact", modelId: "vision", supportsImages: true });
       const draft = { ...mobilePartnerProfileDraft(profilePartner), displayName: "Ada Two", capabilities: { ...profilePartner.capabilities, inputHandoff: false } };
       await expect(mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, draft))
         .resolves.toMatchObject({ revision: 3n, profileVersion: 4n });
@@ -846,7 +858,7 @@ describe("mobile Partner catalog network", () => {
       expect(patches[1]?.patch?.modelChain).toBeUndefined(); expect(patches[1]?.patch?.permissionMode).toBeUndefined();
       expect(patches[1]?.patch?.inputHandoff).toBeUndefined();
       expect(patches[1]?.patch?.taskModelPreference).toEqual({ case: "inheritTaskModel", value: true });
-      const task = { ...profilePartner.capabilities.modelChain[0]!, backendId: "task-backend", modelId: "task-model" };
+      const task = { ...profilePartner.capabilities.modelChain[0]!, backendId: "task-backend", modelId: "task-model", taskModelGroupId: "work" };
       await expect(mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, { ...draft, usesDirectoryDefaults: true, taskModelOverride: task }))
         .resolves.toMatchObject({ taskModelOverride: task });
       expect(patches[2]?.patch).toMatchObject({ usesDirectoryDefaults: true, taskModelPreference: { case: "taskModelOverride", value: task } });

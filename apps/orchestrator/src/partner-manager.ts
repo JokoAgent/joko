@@ -39,6 +39,7 @@ import {
 import { modelRoutingEnabled } from "./backend-model-access.js";
 import type { CreateServiceSessionInput, SessionHost } from "./session-host.js";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
+import { nextPartnerFallback, type PartnerFallbackInput, type PartnerGroupRoutes } from "./partner-task-route.js";
 import type { WorkspaceService } from "./workspace-service.js";
 import { partnerTopicRootMessage } from './partner-topic-context.js';
 
@@ -99,39 +100,22 @@ export type PartnerManagerErrorCode =
   | "PARTNER_DELEGATION_UNAVAILABLE";
 
 export function partnerSessionRuntimeFallback(
-  store: Pick<PartnerStore, "findPartnerByCanonicalSession">,
-  input: {
-    readonly sessionId: string;
-    readonly current: SessionRuntimeProfile;
-    readonly visitedRoutes: readonly string[];
-    readonly currentHop: number;
-  },
-  groupRoutes?: (groupId: string) => readonly SessionRuntimeProfile[]
+  store: Pick<PartnerStore, "findPartnerByCanonicalSession" | "getSessionLink" | "getPartner" | "listProfileVersions">,
+  input: PartnerFallbackInput,
+  groupRoutes?: PartnerGroupRoutes
 ): { readonly owned: boolean; readonly candidate?: SessionRuntimeProfile } {
-  const partner = store.findPartnerByCanonicalSession(input.sessionId);
-  if (partner === undefined) return { owned: false };
+  let partner = store.findPartnerByCanonicalSession(input.sessionId);
+  let chain = partner?.capabilities.modelChain;
+  if (partner === undefined) {
+    const link = store.getSessionLink(input.sessionId);
+    if (!link || (link.role !== "topic" && link.role !== "channel" && link.role !== "delegation")) return { owned: false };
+    chain = store.listProfileVersions(link.partnerId).find(record => record.version === link.profileVersion)?.capabilities.modelChain;
+    if (!chain?.some(route => route.taskModelGroupId)) return { owned: false };
+    partner = store.getPartner(link.partnerId);
+  }
   if (partner.lifecycle !== "active" || partner.initializationState !== "ready") return { owned: true };
-  const key = (route: Pick<SessionRuntimeProfile, "backendId" | "providerId" | "modelId">) =>
-    `${route.backendId}\0${route.providerId}\0${route.modelId}`;
-  const expanded = partner.capabilities.modelChain.flatMap(route => [
-    ...(route.taskModelGroupId ? groupRoutes?.(route.taskModelGroupId) ?? [] : []), route]);
-  const chain = expanded.filter((route, index) => expanded.findIndex(other => key(route) === key(other)) === index);
-  if (input.currentHop >= chain.length - 1) return { owned: true };
-  const visited = new Set([...input.visitedRoutes, key(input.current)]);
-  const currentIndex = chain.findIndex((route) => key(route) === key(input.current));
-  const grouped = partner.capabilities.modelChain.some(route => route.taskModelGroupId);
-  const candidate = (currentIndex < 0 ? chain : [...chain.slice(currentIndex + 1), ...(grouped ? chain.slice(0, currentIndex) : [])])
-    .find((route) => !visited.has(key(route)));
-  return candidate === undefined ? { owned: true } : {
-    owned: true,
-    candidate: {
-      backendId: candidate.backendId,
-      providerId: candidate.providerId,
-      modelId: candidate.modelId,
-      ...(candidate.effort === undefined ? {} : { effort: candidate.effort }),
-      fastMode: candidate.fastMode
-    }
-  };
+  const candidate = nextPartnerFallback(chain ?? [], input, groupRoutes);
+  return candidate === undefined ? { owned: true } : { owned: true, candidate };
 }
 
 export class PartnerManagerError extends Error {
@@ -580,12 +564,15 @@ export class PartnerManager {
     }));
   }
 
-  routineFallback(input: Parameters<typeof partnerSessionRuntimeFallback>[1]): ReturnType<typeof partnerSessionRuntimeFallback> {
+  routineFallback(input: PartnerFallbackInput, groupRoutes?: PartnerGroupRoutes): ReturnType<typeof partnerSessionRuntimeFallback> {
     const link = this.#store.getSessionLink(input.sessionId);
     if (link?.role !== 'routine') return { owned: false };
     const profile = this.getPartner(link.partnerId);
-    if (this.#routineModel?.(profile.id, link.routineKey!) !== undefined) return { owned: true };
-    return partnerSessionRuntimeFallback({ findPartnerByCanonicalSession: () => profile }, input);
+    if (profile.lifecycle !== "active" || profile.initializationState !== "ready" || this.isRoutineSessionRetiring(input.sessionId)
+      || this.#routineModel?.(profile.id, link.routineKey!) !== undefined) return { owned: true };
+    const version = this.#store.listProfileVersions(profile.id).find(item => item.version === link.profileVersion);
+    const candidate = nextPartnerFallback(version?.capabilities.modelChain ?? [], input, groupRoutes);
+    return candidate === undefined ? { owned: true } : { owned: true, candidate };
   }
 
   isRoutineSessionRetiring(sessionId: string): boolean {

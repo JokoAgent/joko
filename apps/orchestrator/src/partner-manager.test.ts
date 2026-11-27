@@ -917,6 +917,26 @@ describe("PartnerManager", () => {
     })).toEqual({ owned: false });
   });
 
+  it("tries the rest of the selected group before later routes in the canonical and linked Partner tasks", async () => {
+    const f = await createFixture();
+    const primary = capabilities().modelChain[0]!;
+    const backup = { ...primary, providerId: "vision", modelId: "multimodal", effort: "high" };
+    const partner = await f.manager.createPartner({ ...createInput(f.partnerStore, "Group order"), capabilities: {
+      ...capabilities(), modelChain: [{ ...primary, taskModelGroupId: "writers" }, backup] } });
+    const channel = f.partnerStore.bindChannelSession({ partnerId: partner.id, expectedRevision: partner.revision,
+      profileVersion: partner.profileVersion, sessionId: "channel-route", key: "channel-1", operationId: "channel-create" });
+    const first = { ...primary, backendId: "another-local-backend" };
+    for (const sessionId of [partner.canonicalSessionId!, channel.sessionId]) {
+      const base = { sessionId, current: primary, currentHop: 0, visitedRoutes: [] };
+      const members = (id: string) => id === "writers" ? [first, primary, first] : undefined;
+      expect(partnerSessionRuntimeFallback(f.partnerStore, base, members)).toEqual({ owned: true, candidate: first });
+      expect(partnerSessionRuntimeFallback(f.partnerStore, { ...base, current: first, currentHop: 1,
+        visitedRoutes: [[primary.backendId, primary.providerId, primary.modelId].join("\0")] }, members)).toEqual({ owned: true, candidate: backup });
+      expect(partnerSessionRuntimeFallback(f.partnerStore, { ...base, current: backup }, members)).toEqual({ owned: true });
+      expect(partnerSessionRuntimeFallback(f.partnerStore, base, () => undefined)).toEqual({ owned: true, candidate: backup });
+    }
+  });
+
   it("saves an ordered mixed Backend chain and changes its primary at the next send without replacing the home task", async () => {
     const second = new FakeBackendAdapter({ ...PARTNER_PROFILE, id: "partner-second" });
     const f = await createFixture(undefined, new FakeBackendAdapter(PARTNER_PROFILE), undefined, [second]);

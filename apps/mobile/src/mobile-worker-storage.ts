@@ -1,7 +1,7 @@
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import { PermissionMode } from "@joko/contracts";
 import { normalizeMobileWorkerForm, type MobileWorkerForm, type MobileWorkerTarget } from "./mobile-collaboration";
-import type { MobileModelControlSelection } from "./mobile-runtime-controls";
+import { resolveMobileModelSpeed, type MobileModelControlSelection } from "./mobile-runtime-controls";
 
 export interface MobileWorkerFormIdentity {
   readonly profileId: string;
@@ -34,10 +34,10 @@ export class MobileWorkerStorage {
     const preference = preferences?.selections[target.backendId];
     const selection = preference?.model;
     const route = selection && target.models.find(value => value.providerId === selection.providerId && value.modelId === selection.modelId);
-    const model = route && typeof selection.fastMode === "boolean"
+    const model = route && (typeof selection.fastMode === "boolean" || selection.fastMode === "ultrafast")
       ? { providerId: route.providerId, modelId: route.modelId,
         ...(target.canSetEffort && route.efforts.some(value => value.id === selection.effortId) ? { effortId: selection.effortId } : {}),
-        fastMode: target.canSetFastMode && route.supportsFastMode && selection.fastMode }
+        fastMode: resolveMobileModelSpeed(route, selection.fastMode, target.canSetFastMode && route.canSetFastMode !== false) }
       : target.defaultModel;
     const permissionMode = preference && target.permissionModes.includes(preference.permissionMode) ? preference.permissionMode
       : target.permissionModes.includes(PermissionMode.AUTO) ? PermissionMode.AUTO : target.permissionModes[0]!;

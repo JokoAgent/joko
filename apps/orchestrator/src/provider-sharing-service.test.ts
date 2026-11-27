@@ -21,6 +21,7 @@ import { ProviderSharingHome, type ProviderSharingRemote, type ProviderSharingRe
 import { createProviderSharingConnectService, createProviderSharingGuestConnectService } from "./provider-sharing-connect-service.js";
 import { providerSharingReshareKey } from "./provider-sharing-ports.js";
 import type { HostedAgentOpen } from "./hosted-agent-host.js";
+import { HOSTED_AGENT_SETTING_KEY } from "./hosted-agent-settings.js";
 import { encodeHostedAgentValue } from "./hosted-agent-wire.js";
 import { HostedAgentPoller } from "./hosted-agent-poller.js";
 import { createHostedAgentSourceController } from "./hosted-agent-source-controller.js";
@@ -35,13 +36,14 @@ async function fixture(options: { readonly backendId?: string; readonly origin?:
   const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "openai-completions", contextWindow: 32768, contextWindowMax: 262144,
     maxOutputTokens: 1024, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
   const backendId = options.backendId ?? "native";
+  const models = [model, { ...model, providerId: "foreign-provider", modelId: "foreign-model" }];
   database.upsertBackend({ id: backendId, adapterKind: "native-test", instanceGeneration: 1, displayName: "Provider host",
     health: "healthy", version: "1", installationState: "installed", authenticationState: "not_required",
-    capabilities: new Map(), models: [model, { ...model, providerId: "foreign-provider", modelId: "foreign-model" }], tools: [], diagnostics: [] });
+    capabilities: new Map(), models, tools: [], diagnostics: [] });
   const native = new HostedAgentRuntime({ store: database, root: join(root, "native"), artifactCapacityBytes: 1024 * 1024, connections,
     authenticateGuest: context => sharing.authenticateNative(context),
     factories: [{ backendId, providerIds: () => ["provider", "foreign-provider"], isolatedGuests: () => true,
-      models: () => [model, { ...model, providerId: "foreign-provider", modelId: "foreign-model" }],
+      models: () => models,
       describe: () => ({ adapterKind: "native-test", providers: [] }), create: async creation => {
         await beforeCreate?.(); if (options.createNative) return options.createNative(creation);
         return { id: backendId, hostedExecutionCapabilities: { toolsOnSource: true, isolatedGuests: true },
@@ -85,7 +87,7 @@ async function fixture(options: { readonly backendId?: string; readonly origin?:
   const approve = async (requestId: string) => { sharing.decide(create(contract.DecideProviderShareRequestRequestSchema, { operationId: crypto.randomUUID(), requestId, approve: true })); await home.refresh(authority); return home.listReceived()[0]!; };
   const open = (runId: string): HostedAgentOpen => ({ runId, nativeSessionId: `native-${runId}`, start: "create", sessionId: "task", targetId: "workspace", generation: 1,
     backendId, providerId: "provider", modelId: "model", permissionMode: "ask", fastMode: false, workspace: { platform: process.platform as "win32" | "linux" | "darwin", shell: "bash", isGitRepository: false } });
-  return { root, database, connections, native, sharing, connect, authority, issue, apply, approve, open,
+  return { root, database, connections, native, models, sharing, connect, authority, issue, apply, approve, open,
     home: () => home, secret: () => seenSecret, submits: () => submits, created: () => created, disposed: () => disposed, captured: () => captured,
     loseSubmit: () => { loseSubmit = true; }, unknownCleanup: (value: boolean) => { cleanupUnknown = value; }, beforeCreate: (value: (() => Promise<void>) | undefined) => { beforeCreate = value; },
     afterRead: (value: (() => Promise<void>) | undefined) => { afterRead = value; },
@@ -109,6 +111,20 @@ it("retains separate working and maximum capacities through the original shared 
 it("intersects Provider and member selections at catalogs, native dispatch and revoked existing runs", async () => {
   const f = await fixture(); try {
     const intent = await f.apply(f.issue().link), received = await f.approve(intent.request!.requestId), captured = f.home().captureNative(received, "source");
+    const reads = vi.spyOn(f.database, "findSetting");
+    const catalogReads = async (expectedModels: number) => {
+      reads.mockClear();
+      const catalog = await captured.client.catalog(signal());
+      expect(catalog.backends[0]!.providers[0]!.models).toHaveLength(expectedModels);
+      return reads.mock.calls.filter(([, , key]) => key === HOSTED_AGENT_SETTING_KEY).length;
+    };
+    const single = await catalogReads(1);
+    f.models.push(...Array.from({ length: 63 }, (_, index) => ({ ...f.models[0]!, modelId: `extra-${index}` })));
+    const expanded = await catalogReads(64);
+    reads.mockRestore();
+    console.info("Shared catalog settings reads", { oneModel: single, sixtyFourModels: expanded });
+    expect(single).toBeGreaterThan(0);
+    expect(expanded).toBe(single);
     await captured.client.open(f.open("model-grant"), signal());
     expect(await captured.client.call("model-grant", "before-revoke", { kind: "state" }, signal()))
       .toMatchObject({ binding: { nativeSessionId: "sdk-1" }, streaming: false });

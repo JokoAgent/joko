@@ -33,12 +33,13 @@ import { CredentialManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import { McpRouter } from "./mcp-router.js";
 
-async function fixture() {
+async function fixture(waitForModelResponse?: Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), "joko-group-source-native-")), calls: { node: string; body: string }[] = [], nativeTrust: { node: string; trust: string; guestHome?: string }[] = [], mcpCalls: string[] = [];
   let failA = false;
   const model = createServer(async (request, response) => {
     const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk)); const body = Buffer.concat(chunks).toString(), node = request.url!.split("/")[1]!;
     calls.push({ node, body }); expect(request.headers.authorization).toBe(`Bearer private-${node}`);
+    if (waitForModelResponse) await waitForModelResponse;
     if (node === "A" && failA) { response.writeHead(529, { "content-type": "application/json" }); response.end(JSON.stringify({ error: { message: "overloaded_error at capacity", type: "overloaded_error" } })); return; }
     const messages = JSON.parse(body).messages as { role: string; content: unknown }[], latestUser = messages.map(message => message.role).lastIndexOf("user");
     const userText = messages.filter(message => message.role === "user").map(message => typeof message.content === "string" ? message.content
@@ -126,11 +127,17 @@ async function fixture() {
   return { root, calls, nativeTrust, mcpCalls, node, pair, fail: (value: boolean) => { failA = value; }, close: async () => { for (const node of nodes.reverse()) await node.close(); model.closeAllConnections(); await new Promise<void>(resolve => model.close(() => resolve())); await rm(root, { recursive: true, force: true, maxRetries: 3 }); } };
 }
 it("runs same-owner C through B's group decision directly on A with the actual Source queue, SDK tools, load and usage reports", { timeout: 90_000 }, async () => {
-  const f = await fixture(); try {
+  let finishModelResponse!: () => void;
+  const waitForResponse = new Promise<void>(resolve => { finishModelResponse = resolve; });
+  const f = await fixture(waitForResponse); try {
     const a = await f.node("A"), b = await f.node("B"), c = await f.node("C"); await f.pair(b, a); await f.pair(c, a); await f.pair(c, b);
     const key = { backendId: "pi", providerId: "provider" }, remoteA = b.groups.sources().find(source => source.nodeId === "A" && source.providerId === "provider")!;
     b.groups.store.update(key, { strategy: "ordered", autoSwitch: true, members: [providerGroupDefaultMember(remoteA), providerGroupDefaultMember(b.groups.sources().find(source => source.kind === "local" && source.providerId === "provider")!)] }, 0n);
     const quotaGroup = b.groups.store.snapshot(key), quotaSignal = new AbortController().signal;
+    let leaseTime = Date.now();
+    vi.spyOn(b.groups.router, "now").mockImplementation(() => leaseTime);
+    vi.spyOn(b.groups.leases, "now").mockImplementation(() => leaseTime);
+    const reports = vi.spyOn(b.groups.leases, "report");
     const remoteQuota = await b.groups.memberAccountUsage(key, quotaGroup.revision, remoteA.key, quotaSignal);
     expect(remoteQuota).toMatchObject({ state: 'ready', accountUsage: { primaryWindow: { usedPercent: 12 } } });
     const ownMember = quotaGroup.config!.members.find(member => member.kind === 'local')!;
@@ -150,6 +157,8 @@ it("runs same-owner C through B's group decision directly on A with the actual S
     const upload = await c.artifacts.ingestBytes(Buffer.from("ORIGINAL_UPLOAD_C"), { fileName: "upload.txt", mimeType: "text/plain" });
     const origin = (await c.host.createSession({ operationId: "owner-artifact-origin", connection: c.connection, targetId: "remote-target", title: "Artifact origin", providerId: "provider", modelId: "model",
       permissionMode: "bypassPermissions", planMode: false, fastMode: false })).value.sessionId;
+    expect(c.groups.store.binding(origin)?.memberKey).toBe(remoteA.key);
+    expect(b.groups.leases.count(remoteA.key)).toBe(2);
     const report = await c.artifacts.ingestBytes(Buffer.from("ORIGINAL_ARTIFACT_C"), { fileName: "report.txt", mimeType: "text/plain", expiresAt: Date.now() + 60_000 });
     c.store.transaction(() => c.store.adoptSessionArtifact({ blob: c.store.getArtifact(report.id).blob, sessionId: origin }));
     const queued = c.host.enqueueInput({ operationId: "owner-group-send", connection: c.connection, sessionId, prompt: { text: "Read all original inputs", images: [], files: [{ blob: c.store.getArtifact(upload.id).blob }],
@@ -157,6 +166,10 @@ it("runs same-owner C through B's group decision directly on A with the actual S
         { kind: "artifact", reference: report.id, sourceSessionId: origin, label: "Original report" },
         { kind: "workspace_directory", workspaceId: "original-project-workspace", reference: ".", label: "Original project" },
         { kind: "resource", reference: resource.id, label: resource.name, discoveredRevision: resource.revision!, resourceVersion: resource.resourceVersion!.toString(), runtimeGeneration: resource.runtimeGeneration! }], disposition: "prompt" } }).value;
+    await vi.waitFor(() => expect(reports.mock.calls.some(([controller, , leases]) =>
+      leases.some(lease => lease.sessionId === JSON.stringify([controller, sessionId]) && lease.memberKey === remoteA.key))).toBe(true), { timeout: 20_000 });
+    expect(b.groups.leases.count(remoteA.key)).toBe(2);
+    finishModelResponse();
     await vi.waitFor(() => expect(c.store.getQueueItem(queued.queueItemId).state).toBe("completed"), { timeout: 30_000 }).catch(error => {
       console.info("owner native state", c.store.listRuns({ sessionId }).map(run => [run.descriptor.id, run.descriptor.state, run.descriptor.activeAttemptId, run.descriptor.error]), c.store.listDiagnostics().map(row => [row.component, row.message]),
         c.store.listEvents({ sessionId, limit: 1000 }).map(event => event.payload.type === "error" ? [event.payload.type, event.payload.error.code] : event.payload.type === "run_state" ? [event.payload.type, event.payload.state, event.traceId, event.runId, event.operationId] : event.payload.type),
@@ -176,8 +189,11 @@ it("runs same-owner C through B's group decision directly on A with the actual S
     expect(actualUsage?.snapshot?.primaryWindow?.usedPercent).toBe(12);
     await vi.waitFor(() => expect(b.groups.usage.usage.rows({ group: key }).length).toBeGreaterThan(0), { timeout: 25_000 });
     expect(b.groups.usage.usage.rows({ group: key })[0]).toMatchObject({ nodeId: "A", partyId: "owner", turns: 1 });
+    // C ran the original task. The separate artifact task was picked but never sent.
+    await vi.waitFor(() => expect(b.groups.leases.count(remoteA.key)).toBe(1), { timeout: 10_000 });
+    leaseTime += 30_000;
     expect(b.groups.leases.count(remoteA.key)).toBe(0);
-  } finally { await f.close(); }
+  } finally { finishModelResponse(); await f.close(); }
 });
 
 it("tries another authorized group computer after a positively rejected native capacity admission", { timeout: 90_000 }, async () => {

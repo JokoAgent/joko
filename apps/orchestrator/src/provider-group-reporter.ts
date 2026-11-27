@@ -1,6 +1,6 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
-import type { ProviderGroupStore } from "@joko/store";
+import type { ProviderGroupKey, ProviderGroupStore } from "@joko/store";
 import type { ProviderGroupRemoteRouter } from "./provider-group-remote.js";
 import type { ProviderGroupLeases } from "./provider-group-leases.js";
 import type { ProviderGroupUsage } from "./provider-group-usage.js";
@@ -13,13 +13,17 @@ export class ProviderGroupReporter {
   readonly #heartbeat: ReturnType<typeof setInterval>;
   #leaseTimer?: ReturnType<typeof setTimeout>; #usageTimer?: ReturnType<typeof setTimeout>;
   #leaseFlight?: Promise<void>; #usageFlight?: Promise<void>; #usageFailures = 0;
+  #usageChangedDuringSend = false;
   constructor(readonly options: { readonly groups: ProviderGroupStore; readonly remote: ProviderGroupRemoteRouter; readonly leases: ProviderGroupLeases; readonly usage: ProviderGroupUsage;
     readonly now?: () => number }) {
     this.#heartbeat = setInterval(() => { this.leasesChanged(); }, 60_000); this.#heartbeat.unref();
     this.leasesChanged(); this.#scheduleUsage(20_000);
   }
   leasesChanged(): void { if (!this.#lifetime.signal.aborted && !this.#leaseTimer) { this.#leaseTimer = setTimeout(() => { this.#leaseTimer = undefined; void this.#sendLeases().catch(() => this.#scheduleLeasesRetry()); }, 1000); this.#leaseTimer.unref(); } }
-  usageChanged(): void { if (!this.#lifetime.signal.aborted) this.#scheduleUsage(5000); }
+  usageChanged(): void {
+    if (this.#usageFlight) this.#usageChangedDuringSend = true;
+    else this.#scheduleUsage(5000);
+  }
   async close(): Promise<void> {
     clearInterval(this.#heartbeat); clearTimeout(this.#leaseTimer); clearTimeout(this.#usageTimer);
     // Send the terminal full empty snapshot before closing its captured owner.
@@ -27,29 +31,40 @@ export class ProviderGroupReporter {
     this.#lifetime.abort(); await this.#usageFlight?.catch(() => {});
   }
   #owners() { return [...new Map(this.options.groups.remoteSnapshots().flatMap(group => group.ownerNodeId ? [[group.ownerNodeId, { backendId: group.backendId, providerId: group.providerId }] as const] : [])).entries()]; }
+  async #reportToOwners(send: (nodeId: string, group: ProviderGroupKey) => Promise<void>): Promise<void> {
+    const results = await Promise.allSettled(this.#owners().map(([nodeId, group]) => send(nodeId, group)));
+    const failure = results.find(result => result.status === "rejected");
+    if (failure) throw failure.reason;
+  }
   #sendLeases(empty = false): Promise<void> {
-    return this.#leaseFlight ??= (async () => {
-      for (const [nodeId, group] of this.#owners()) {
+    return this.#leaseFlight ??= this.#reportToOwners(async (nodeId, group) => {
         const owner = this.options.remote.capture(group), active = empty ? [] : this.options.leases.active();
         const leases = active.flatMap(lease => { const binding = this.options.groups.binding(lease.sessionId); if (!binding || binding.ownerNodeId !== nodeId) return [];
           const member = this.options.groups.snapshot(binding.group).config?.members.find(member => member.key === binding.memberKey); if (!member) return [];
           return [{ sessionId: lease.sessionId, memberKey: member.key, backendId: member.nativeBackendId, providerId: member.providerId }]; });
         const sequence = this.options.usage.usage.nextSequence("leases:" + nodeId, this.#now());
         await owner.client.reportProviderGroupLeases({ sequence, leases }, { signal: AbortSignal.any([this.#lifetime.signal, AbortSignal.timeout(5000)]) }); owner.assertCurrent();
-      }
-    })().finally(() => { this.#leaseFlight = undefined; });
+    }).finally(() => { this.#leaseFlight = undefined; });
   }
   #scheduleLeasesRetry(): void { if (!this.#lifetime.signal.aborted && !this.#leaseTimer) { this.#leaseTimer = setTimeout(() => { this.#leaseTimer = undefined; void this.#sendLeases().catch(() => this.#scheduleLeasesRetry()); }, 15_000); this.#leaseTimer.unref(); } }
   #scheduleUsage(delay: number): void {
     if (this.#usageTimer || this.#lifetime.signal.aborted) return;
-    this.#usageTimer = setTimeout(() => { this.#usageTimer = undefined; void this.#sendUsage().then(() => { this.#usageFailures = 0; }, () => {
-      const delay = Math.min(600_000, 30_000 * 2 ** Math.min(5, this.#usageFailures++)); this.#scheduleUsage(delay);
-    }); }, delay); this.#usageTimer.unref();
+    this.#usageTimer = setTimeout(() => {
+      this.#usageTimer = undefined;
+      this.#usageChangedDuringSend = false;
+      void this.#sendUsage().then(() => {
+        this.#usageFailures = 0;
+        if (this.#usageChangedDuringSend) this.#scheduleUsage(5000);
+      }, () => {
+        const retry = Math.min(600_000, 30_000 * 2 ** Math.min(5, this.#usageFailures++));
+        this.#scheduleUsage(this.#usageChangedDuringSend ? 5000 : retry);
+      });
+    }, delay); this.#usageTimer.unref();
   }
   #sendUsage(): Promise<void> {
     return this.#usageFlight ??= (async () => {
       const sinceDay = "1970-01-01", all = this.options.usage.usage.localRows(sinceDay);
-      for (const [nodeId, group] of this.#owners()) {
+      await this.#reportToOwners(async (nodeId, group) => {
         const owner = this.options.remote.capture(group), groups = this.options.groups.remoteSnapshots().filter(group => group.ownerNodeId === nodeId);
         const rows = all.filter(row => groups.some(group => group.backendId === row.group.backendId && group.providerId === row.group.providerId)).map(row => {
           const source = this.options.remote.capture(row.group);
@@ -64,7 +79,7 @@ export class ProviderGroupReporter {
             { signal: AbortSignal.any([this.#lifetime.signal, AbortSignal.timeout(15_000)]) });
           owner.assertCurrent(); if (!result.accepted || result.complete !== (index === parts.length - 1)) throw new Error("Provider usage snapshot was not acknowledged.");
         }
-      }
+      });
     })().finally(() => { this.#usageFlight = undefined; });
   }
   #now(): number { return this.options.now?.() ?? Date.now(); }

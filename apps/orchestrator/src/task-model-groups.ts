@@ -123,18 +123,18 @@ export class TaskModelGroups {
       ? create(contract.TaskModelGroupSelectionSchema, { groupId, expectedRevision: config.revision }) : undefined;
   }
 
-  localFallbacks(groupId: string): SessionRuntimeProfile[] {
+  localFallbacks(groupId: string): SessionRuntimeProfile[] | undefined {
     const { groups } = this.config;
     const original = groups.find(group => group.groupId === groupId);
-    if (!original) return [];
+    if (!original) return undefined;
     const effective = scheduledGroup(original, groups, new Date(this.options.now()).getHours());
-    const reachable = new Set([effective, original]);
+    const reachable = new Set([original]);
     for (const group of reachable) for (const window of group.schedules) {
       const next = groups.find(item => item.groupId === window.useGroupId);
       if (next) reachable.add(next);
     }
     const sources = this.options.directory.sources();
-    return [...reachable].flatMap(group => group.candidates.flatMap(candidate => {
+    return [effective, ...[...reachable].filter(group => group !== effective)].flatMap(group => group.candidates.flatMap(candidate => {
       const ref = candidate.source;
       const source = sources.find(row => row.kind === "local" && row.key === ref.sourceKey && row.backendId === ref.backendId && row.providerId === ref.providerId);
       const model = source?.models.find(row => row.modelId === ref.modelId);
@@ -295,8 +295,8 @@ export class TaskModelGroups {
 
   private cost(source: ProviderGroupDirectorySource, model: ProviderModel, status: ProviderGroupMemberStatus, at: number): number {
     const quota = status.quota;
-    if (quota.pacingWindow || quota.weeklyResetAt !== undefined || quota.fiveHourResetAt !== undefined) return 0;
-    if (source.brand === "openai" || source.brand === "anthropic") return Infinity;
+    if (quota.headroom !== undefined || quota.pacingWindow || quota.weeklyResetAt !== undefined || quota.fiveHourResetAt !== undefined) return 0;
+    if (source.accessKind === "subscription" || source.openAiAccount?.(model.modelId)?.kind === "subscription") return Infinity;
     const quote = source.kind === "local"
       ? modelPricesWithOverride(model, this.options.store.findModelPriceOverride(this.options.ownerId, source.backendId, source.providerId, model.modelId), { at })
       : modelTokenPricesAt(model, { at });

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { create } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
-import { groupKey, type ProviderGroupKey, type ProviderGroupStore } from "@joko/store";
+import { groupKey, RevisionConflictError, type ProviderGroupKey, type ProviderGroupStore } from "@joko/store";
 import { providerGroupDefaultMember, type ProviderGroupDirectory, type ProviderGroupDirectorySource } from "./provider-group-directory.js";
 import type { ProviderDescriptor } from "./credential-manager.js";
 
@@ -20,14 +20,16 @@ export function officialOpenAiEndpoint(raw: string | undefined): boolean {
   } catch { return false; }
 }
 
-export function isOfficialOpenAiKeyModel(entry: ProviderDescriptor, modelId: string): boolean {
+export function isOfficialOpenAiKeyModel(entry: Pick<ProviderDescriptor, "provider" | "enabled" | "authenticationState" | "kind" | "nativeCredentialReferenceId" | "credentialOrigin" | "requestPath">, modelId: string): boolean {
   const model = entry.provider.models.find(item => item.id === modelId);
   return !!model && entry.enabled && entry.authenticationState === "authenticated"
     && (entry.kind === "api_key" || entry.kind === "custom_endpoint") && !!entry.provider.apiKeyEnv
-    && !entry.provider.keyless && !entry.nativeCredentialReferenceId && Object.keys(entry.provider.headers ?? {}).length === 0
+    && !entry.provider.keyless && !entry.nativeCredentialReferenceId
+    && Object.keys(entry.provider.headers ?? {}).every(name => ["openai-project", "openai-organization"].includes(name.toLowerCase()))
     && entry.credentialOrigin === "https://api.openai.com" && officialOpenAiEndpoint(entry.provider.baseUrl)
     && (model.api ?? entry.provider.api) === "openai-responses" && model.supportsTools !== false
-    && (!model.baseUrl || officialOpenAiEndpoint(model.baseUrl)) && (!entry.requestPath || entry.requestPath === "/responses");
+    && (!model.baseUrl || officialOpenAiEndpoint(model.baseUrl))
+    && (entry.requestPath === undefined || /^\/v1\/responses\/?$/.test(entry.requestPath));
 }
 
 export class LocalOpenAiPools {
@@ -62,7 +64,8 @@ export class LocalOpenAiPools {
   #set(target: ProviderGroupKey, source: ProviderGroupKey, included: boolean, revision: bigint) {
     const key = localOpenAiPoolKey(target), group = this.store.snapshot(key), members = group.config?.members ?? [];
     if (groupKey(target) === groupKey(source)) throw new Error("Select a different local OpenAI account.");
-    let next = members.filter(row => groupKey(row) !== groupKey(source));
+    if (revision !== group.revision) throw new RevisionConflictError("provider group", groupKey(key), revision, group.revision);
+    let next = members;
     if (included) {
       const { rows } = this.#sources(target);
       const to = rows.find(row => groupKey(row.source) === groupKey(target)), from = rows.find(row => groupKey(row.source) === groupKey(source));
@@ -77,10 +80,16 @@ export class LocalOpenAiPools {
         throw new Error("A selected connection already belongs to another account pool.");
       }
       to.source.assertCurrent(); from.source.assertCurrent();
+      if (members.some(row => groupKey(row) === groupKey(source))) return this.get(target);
       if (!next.length) next = [providerGroupDefaultMember(to.source)];
       next = [...next, providerGroupDefaultMember(from.source)];
+    } else {
+      next = members.filter(row => groupKey(row) !== groupKey(source));
+      if (next.length === members.length) return this.get(target);
     }
-    const updated = this.store.update(key, next.length > 1 ? { strategy: "ordered", autoSwitch: true, members: next } : undefined, revision);
+    const updated = this.store.update(key, next.length > 1 ? {
+      strategy: group.config?.strategy ?? "ordered", autoSwitch: group.config?.autoSwitch ?? true, members: next
+    } : undefined, revision);
     // Every member is local. Binding releases were persisted by update in this transaction.
     for (const cleanup of updated.cleanup) this.store.acknowledgeCleanup(key, cleanup.id);
     return this.get(target);

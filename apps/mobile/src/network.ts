@@ -3,6 +3,7 @@ import { encodeModelSpeed } from "@joko/contracts";
 import { createProviderAccountResetApi } from "@joko/connection-transport";
 import { streamTaskActivity } from "@joko/connection-transport";
 import { ProviderGroupService, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
+import type { MobileTaskModelGroupCatalog, MobileTaskModelGroupChoice, MobileTaskModelGroupMedia } from "./mobile-task-model-groups";
 import { readSessionArchivePreview, type SessionArchivePreview } from "@joko/contracts";
 import { mobileMediaByteCache } from "./mobile-media-byte-cache";
 import { readMobileExtensionMainViewResource } from "./mobile-extension-main-view-resource";
@@ -317,6 +318,8 @@ export interface MobileNetwork {
   partnerIdentityApi?(credential: PairedCredential, ownerKey: string, assertCurrent: (signal: AbortSignal) => void): MobilePartnerIdentityApi;
   listPartnerCatalog?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerCatalog>;
   getPartnerProfileOptions?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerProfileOptions>;
+  listTaskModelGroups?(credential: PairedCredential, signal?: AbortSignal): Promise<MobileTaskModelGroupCatalog | undefined>;
+  previewTaskModelGroup?(credential: PairedCredential, choice: MobileTaskModelGroupChoice, hasImages: boolean, signal?: AbortSignal): Promise<MobileTaskModelGroupMedia | undefined>;
   resumePartner?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
     signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
   updatePartnerProfile?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
@@ -1600,7 +1603,27 @@ function validRemoteDesktopDisplayModes(modes: readonly RemoteDesktopDisplayMode
       && typeof mode.current === "boolean" && typeof mode.native === "boolean");
 }
 
+async function listTaskModelGroups(credential: PairedCredential, signal?: AbortSignal): Promise<MobileTaskModelGroupCatalog | undefined> {
+  try {
+    const { config } = await createClient(ProviderGroupService, credentialTransport(credential)).listTaskModelGroups({}, options(signal));
+    signal?.throwIfAborted();
+    return config ? { revision: config.revision.toString(), groups: config.groups.map(group => ({ id: group.groupId, name: group.name })) } : undefined;
+  } catch (error) {
+    if (error instanceof ConnectError && [Code.Unimplemented, Code.PermissionDenied].includes(error.code)) return undefined;
+    throw error;
+  }
+}
+
 export const mobileNetwork: MobileNetwork = {
+  listTaskModelGroups,
+  async previewTaskModelGroup(credential, choice, hasImages, signal) {
+    const { selected } = await createClient(ProviderGroupService, credentialTransport(credential)).previewTaskModelGroup({
+      selection: { groupId: choice.groupId, expectedRevision: BigInt(choice.revision), hasImages }
+    }, options(signal));
+    const source = selected?.source;
+    return selected?.available && source ? { backendId: source.backendId, providerId: source.providerId,
+      modelId: source.modelId, supportsImages: selected.supportsImages } : undefined;
+  },
   deviceAuthorizationTransport: invitation => transport(invitation.origin, undefined, invitation.endpointPublicKey, invitation.endpointTransport?.kind ?? 'https'),
   deviceAuthorizationOwner: (credential, assertCurrent) => deviceAuthorizationOwner(createClient(ConnectionService, credentialTransport(credential)), assertCurrent),
   serverAccess: (credential, assertCurrent) => serverAccessClient(createClient(ServerAccessService, credentialTransport(credential)), assertCurrent, `${credential.serverId}:${credential.connectionId}`),
@@ -2129,9 +2152,12 @@ export const mobileNetwork: MobileNetwork = {
     return projectMobilePartners(response);
   },
   async getPartnerCreationOptions(credential, signal) {
-    const response = await createClient(PartnerService, credentialTransport(credential)).getPartnerDirectory({}, options(signal));
+    const [response, modelGroups] = await Promise.all([
+      createClient(PartnerService, credentialTransport(credential)).getPartnerDirectory({}, options(signal)),
+      listTaskModelGroups(credential, signal).catch(() => undefined)
+    ]);
     signal?.throwIfAborted();
-    return projectMobilePartnerCreationOptions(response.directory);
+    return { ...projectMobilePartnerCreationOptions(response.directory), modelGroups };
   },
   async createPartner(credential, requestId, expectedDirectoryRevision, draft, signal) {
     signal?.throwIfAborted();
@@ -2246,9 +2272,12 @@ export const mobileNetwork: MobileNetwork = {
     return projectMobilePartnerReadResponse(partnerId, throughCursor, response);
   },
   async getPartnerProfileOptions(credential, signal) {
-    const response = await createClient(PartnerService, credentialTransport(credential))
-      .getPartnerDirectory({}, options(signal));
-    return projectMobilePartnerProfileOptions(response.directory);
+    const [response, modelGroups] = await Promise.all([
+      createClient(PartnerService, credentialTransport(credential)).getPartnerDirectory({}, options(signal)),
+      listTaskModelGroups(credential, signal).catch(() => undefined)
+    ]);
+    signal?.throwIfAborted();
+    return { ...projectMobilePartnerProfileOptions(response.directory), modelGroups };
   },
   async updatePartnerProfile(credential, partnerId, expectedRevision, draft, signal) {
     if (!validMobilePartnerId(partnerId) || expectedRevision < 1n) throw new Error("Select a current Partner profile.");

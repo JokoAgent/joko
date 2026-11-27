@@ -1,4 +1,4 @@
-import { groupKey, ProviderGroupStore, type ProviderGroupKey, type ProviderGroupMember, type ProviderGroupSnapshot } from "@joko/store";
+import { groupKey, providerGroupCapacity, ProviderGroupStore, type ProviderGroupKey, type ProviderGroupMember, type ProviderGroupSnapshot } from "@joko/store";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 import { ProviderGroupDirectory, type ProviderGroupDirectoryRequest, type ProviderGroupMemberStatus } from "./provider-group-directory.js";
 import { ProviderGroupLeases } from "./provider-group-leases.js";
@@ -10,8 +10,9 @@ import { isLocalOpenAiPool } from "./local-openai-pool.js";
 export interface ProviderGroupAssignment {
   readonly group: ProviderGroupKey; readonly snapshot: ProviderGroupSnapshot; readonly member: ProviderGroupMember;
   readonly status: ProviderGroupMemberStatus; readonly profile: SessionRuntimeProfile;
-  assertCurrent(): void; commit(): void; release(): void;
+  assertCurrent(signal?: AbortSignal): void; commit(): void; release(): void;
 }
+export type ProviderGroupHostedSelection = Pick<ProviderGroupAssignment, "member" | "profile" | "snapshot" | "release"> & { assertCurrent(): void };
 interface Tried { readonly until: number; readonly keys: Set<string>; }
 export interface ProviderGroupRemoteRouterPort {
   owns(group: ProviderGroupKey): boolean;
@@ -28,21 +29,40 @@ export interface ProviderGroupPick extends ProviderGroupDirectoryRequest {
 export class ProviderGroupRouter {
   readonly #lastPicked = new Map<string, string>();
   readonly #tried = new Map<string, Tried>();
-  readonly #remoteSelections = new Map<string, { readonly at: number; readonly assignment: ProviderGroupAssignment }>();
+  readonly #remoteSelections = new Map<string, { readonly at: number; readonly requestedModelId: string; readonly assignment: ProviderGroupAssignment }>();
   constructor(readonly store: ProviderGroupStore, readonly directory: ProviderGroupDirectory, readonly leases: ProviderGroupLeases,
     readonly now: () => number = Date.now, readonly random: () => number = Math.random, readonly remote?: ProviderGroupRemoteRouterPort) {}
   async prepare(group: ProviderGroupKey, signal: AbortSignal): Promise<void> { if (this.remote?.owns(group)) await this.remote.prepare(group, signal); }
   readMember(group: ProviderGroupKey, member: ProviderGroupMember, request: ProviderGroupDirectoryRequest, signal: AbortSignal): Promise<ProviderGroupMemberStatus> {
     return this.remote?.owns(group) ? this.remote.read(group, member, request, signal) : this.directory.read(member, { ...request, localAccounts: isLocalOpenAiPool(group) }, signal);
   }
-  rememberRemoteSelection(deviceId: string, sessionId: string, assignment: ProviderGroupAssignment): void {
-    for (const [key, value] of this.#remoteSelections) if (this.now() - value.at > 30_000) this.#remoteSelections.delete(key);
-    if (this.#remoteSelections.size >= 4096) throw new ProviderGroupUnavailableError();
-    this.#remoteSelections.set(JSON.stringify([deviceId, sessionId, groupKey(assignment.group)]), { at: this.now(), assignment });
+  rememberRemoteSelection(deviceId: string, sessionId: string, requestedModelId: string, assignment: ProviderGroupAssignment): void {
+    const now = this.now();
+    for (const [key, value] of this.#remoteSelections) if (now - value.at >= 30_000) {
+      value.assignment.release();
+      this.#remoteSelections.delete(key);
+    }
+    const key = JSON.stringify([deviceId, sessionId, groupKey(assignment.group)]);
+    const previous = this.#remoteSelections.get(key);
+    if (!previous && this.#remoteSelections.size >= 4096) throw new ProviderGroupUnavailableError();
+    previous?.assignment.release();
+    this.#remoteSelections.set(key, { at: now, requestedModelId, assignment });
   }
-  takeRemoteSelection(deviceId: string, sessionId: string, group: ProviderGroupKey): ProviderGroupAssignment | undefined {
-    const key = JSON.stringify([deviceId, sessionId, groupKey(group)]), value = this.#remoteSelections.get(key); this.#remoteSelections.delete(key);
-    if (!value || this.now() - value.at > 30_000) return undefined; value.assignment.assertCurrent(); return value.assignment;
+  takeRemoteSelection(deviceId: string, sessionId: string, profile: SessionRuntimeProfile, signal: AbortSignal): ProviderGroupHostedSelection | undefined {
+    const key = JSON.stringify([deviceId, sessionId, groupKey(profile)]), value = this.#remoteSelections.get(key);
+    if (!value) return undefined;
+    this.#remoteSelections.delete(key);
+    if (this.now() - value.at >= 30_000 || value.requestedModelId !== profile.modelId
+      || value.assignment.profile.effort !== profile.effort || value.assignment.profile.fastMode !== profile.fastMode) {
+      value.assignment.release(); return undefined;
+    }
+    // The pick RPC has already finished. Check the captured source and group
+    // revision under the lifetime of the native session consuming the pick.
+    const { member, profile: selectedProfile, snapshot, release } = value.assignment;
+    const assertCurrent = () => value.assignment.assertCurrent(signal);
+    try { assertCurrent(); }
+    catch (error) { release(); throw error; }
+    return { member, profile: selectedProfile, snapshot, release, assertCurrent };
   }
   async pick(input: ProviderGroupPick, signal: AbortSignal): Promise<ProviderGroupAssignment> {
     if (this.remote?.owns(input.group)) return this.remote.pick({ ...input, exclude: new Set([...this.tried(input.sessionId), ...(input.exclude ?? [])]) }, signal);
@@ -58,7 +78,7 @@ export class ProviderGroupRouter {
         ? status?.model?.supportsUltrafastMode === true : status?.model?.supportsFastMode === true);
       const effortSupported = input.profile.effort === undefined || status?.model?.thinkingLevels.includes(input.profile.effort) === true;
       return { id: member.key, available: status?.available === true && speedSupported && effortSupported && !cooling.some(row => row.memberKey === member.key && (row.modelId === undefined || row.modelId === status?.model?.modelId)),
-        paused: member.paused && !(member.kind === "local" && input.ownTask), running: this.leases.count(member.key, status?.running), capacity: member.capacity, weight: member.weight,
+        paused: member.paused && !(member.kind === "local" && input.ownTask), running: this.leases.count(member.key, status?.running), capacity: providerGroupCapacity(member), weight: member.weight,
         ...(status?.quota.urgency === undefined ? {} : { urgency: status.quota.urgency }), fiveHourTight: status?.quota.fiveHourTight === true,
         ...(status?.quota.usagePercent === undefined ? {} : { usagePercent: status.quota.usagePercent }),
         ...(status?.quota.weeklyResetAt === undefined ? {} : { weeklyResetAt: status.quota.weeklyResetAt }),
@@ -94,7 +114,7 @@ export class ProviderGroupRouter {
     }
     if (input.quotaRebalanceFrom !== undefined) {
       const from = members.find(candidate => candidate.member.key === input.quotaRebalanceFrom), member = status.member;
-      if (!from?.available || from.member.nodeId === member.nodeId || member.paused || this.leases.count(member.key, status.running) >= member.capacity
+      if (!from?.available || from.member.nodeId === member.nodeId || member.paused || this.leases.count(member.key, status.running) >= providerGroupCapacity(member)
         || status.quota.fiveHourTight || providerGroupRebalanceTarget(from.quota, [{ key: member.key, quota: status.quota }], this.now()) !== member.key) throw new ProviderGroupUnavailableError();
     }
     status.assertCurrent(); const member = status.member;
@@ -102,8 +122,8 @@ export class ProviderGroupRouter {
     this.#lastPicked.set(groupKey(input.group), member.key);
     const profile: SessionRuntimeProfile = { ...input.profile, backendId: member.backendId, providerId: member.providerId, modelId: status.model.modelId };
     let committed = false;
-    const assertCurrent = () => {
-      status.assertCurrent(); const current = this.store.snapshot(input.group);
+    const assertCurrent = (active = signal) => {
+      status.assertCurrent(active); const current = this.store.snapshot(input.group);
       if (current.revision !== snapshot.revision || !current.config?.members.some(row => row.key === member.key)) throw new ProviderGroupUnavailableError();
     };
     return { group: input.group, snapshot, member, status, profile, assertCurrent, release: reservation.release,

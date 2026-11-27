@@ -125,11 +125,16 @@ function GroupPanel({ api, provider, t }: { readonly api: ProviderGroupSettingsA
         const move = (direction: number) => { const members = [...draft.members], other = index + direction; if (other < 0 || other >= members.length) return; [members[index], members[other]] = [members[other]!, members[index]!]; change({ ...draft, members }); };
         return <div className="provider-group-settings__member" key={member.key}>
           <label className="provider-group-settings__choice"><input type="checkbox" checked={selected !== undefined} disabled={busy} onChange={event => change({ ...draft,
-            members: event.target.checked ? [...draft.members, { value: member, capacity: String(member.capacity), weight: String(member.weight) }] : draft.members.filter(row => row.value.key !== member.key) })} />
+            members: event.target.checked ? [...draft.members, memberDraft(member)] : draft.members.filter(row => row.value.key !== member.key) })} />
             <strong>{member.displayName}</strong>{!candidate.available && <span className="muted">{t("settings.providerGroups.unavailable")}</span>}</label>
           {selected && <div className="provider-group-settings__fields">
-            <label>{t("settings.providerGroups.capacity")}<input type="number" min={1} max={16} step={1} inputMode="numeric" value={selected.capacity} disabled={busy}
-              aria-invalid={!parseInteger(selected.capacity, 16)} onChange={event => setMember({ capacity: event.target.value })} /></label>
+            <label>{t("settings.providerGroups.capacity")}{member.unlimitedCapacity !== undefined || selected.value.unlimitedCapacity !== undefined
+              ? <select value={selected.capacity} disabled={busy} onChange={event => setMember({ capacity: event.target.value })}>
+                <option value="unlimited">{t("settings.providerGroups.unlimited")}</option>
+                {Array.from({ length: 16 }, (_, index) => <option key={index + 1} value={index + 1}>{index + 1}</option>)}
+              </select>
+              : <input type="number" min={1} max={16} step={1} inputMode="numeric" value={selected.capacity} disabled={busy}
+                aria-invalid={!parseInteger(selected.capacity, 16)} onChange={event => setMember({ capacity: event.target.value })} />}</label>
             <label>{t("settings.providerGroups.weight")}<input type="number" min={1} max={100} step={1} inputMode="numeric" value={selected.weight} disabled={busy}
               aria-invalid={!parseInteger(selected.weight, 100)} onChange={event => setMember({ weight: event.target.value })} /></label>
             <label>{t("settings.providerGroups.paused")}<SwitchControl checked={selected.value.paused} disabled={busy} aria-label={`${t("settings.providerGroups.paused")} ${member.displayName}`}
@@ -187,9 +192,14 @@ function UsagePanel({ api, provider, t }: { readonly api: ProviderGroupSettingsA
 }
 function keyOf(value: { readonly backendId: string; readonly providerId: string }): string { return JSON.stringify([value.backendId, value.providerId]); }
 function formatMicros(value: bigint): string { const fraction = (value % 1_000_000n).toString().padStart(6, "0").replace(/0+$/u, ""); return (value / 1_000_000n).toLocaleString() + (fraction ? "." + fraction : ""); }
-function toDraft(value: contract.ProviderGroupConfig): Draft { return { strategy: value.strategy, autoSwitch: value.autoSwitch, members: value.members.map(value => ({ value, capacity: String(value.capacity), weight: String(value.weight) })) }; }
+function memberDraft(value: contract.ProviderGroupMember): DraftMember {
+  return { value, capacity: value.unlimitedCapacity ? "unlimited" : String(value.capacity), weight: String(value.weight) };
+}
+function toDraft(value: contract.ProviderGroupConfig): Draft { return { strategy: value.strategy, autoSwitch: value.autoSwitch, members: value.members.map(memberDraft) }; }
 function parseInteger(value: string, maximum: number): number | undefined { const number = Number(value); return /^\d+$/u.test(value) && Number.isSafeInteger(number) && number >= 1 && number <= maximum ? number : undefined; }
 function validDraft(value: Draft): contract.ProviderGroupConfig | undefined {
-  if (value.members.some(member => !parseInteger(member.capacity, 16) || !parseInteger(member.weight, 100))) return undefined;
-  return create(contract.ProviderGroupConfigSchema, { strategy: value.strategy, autoSwitch: value.autoSwitch, members: value.members.map(member => ({ ...member.value, capacity: parseInteger(member.capacity, 16)!, weight: parseInteger(member.weight, 100)! })) });
+  if (value.members.some(member => (member.capacity !== "unlimited" && !parseInteger(member.capacity, 16)) || !parseInteger(member.weight, 100))) return undefined;
+  return create(contract.ProviderGroupConfigSchema, { strategy: value.strategy, autoSwitch: value.autoSwitch, members: value.members.map(member => ({
+    ...member.value, capacity: member.capacity === "unlimited" ? 4 : Number(member.capacity), unlimitedCapacity: member.capacity === "unlimited", weight: Number(member.weight)
+  })) });
 }

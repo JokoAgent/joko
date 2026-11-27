@@ -36,6 +36,9 @@ import {
   type MobileRuntimeControls
 } from "./mobile-runtime-controls";
 
+import { MobileTaskModelGroupPicker } from "./MobileTaskModelGroupPicker";
+import type { MobileGroupCatalogTransport, MobileTaskModelGroupChoice } from "./mobile-task-model-groups";
+
 type RuntimeControlsView =
   | { readonly kind: "root" }
   | { readonly kind: "model"; readonly routeKey: string; readonly favoriteId?: string }
@@ -50,6 +53,7 @@ export function MobileRuntimeControlsSheet({
   locale,
   onClose,
   onSetModel,
+  modelGroups, onSetModelGroup,
   onMutateFavorite,
   newFavoriteId,
   onSetPermission,
@@ -74,6 +78,8 @@ export function MobileRuntimeControlsSheet({
   readonly onSetPlanMode: (authorityKey: string, enabled: boolean) => Promise<boolean>;
   readonly onError: (message: string) => void;
   readonly providerUsageTransport?: MobileProviderUsageTransport;
+  readonly modelGroups?: MobileGroupCatalogTransport;
+  readonly onSetModelGroup?: (authorityKey: string, choice: MobileTaskModelGroupChoice) => Promise<boolean>;
 }) {
   const [view, setView] = useState<RuntimeControlsView>({ kind: "root" });
   const [query, setQuery] = useState("");
@@ -226,6 +232,15 @@ export function MobileRuntimeControlsSheet({
           scrollEventThrottle={16} onScroll={(event) => {
             if (view.kind === "root") rootScrollOffsetRef.current = event.nativeEvent.contentOffset.y;
           }}>
+          {visible && view.kind === "root" && controls.canSwitchModel && modelGroups && onSetModelGroup && <MobileTaskModelGroupPicker
+            transport={modelGroups} value={controls.taskModelGroupId} colors={colors} locale={locale} disabled={disabled}
+            onSelect={choice => {
+              if (choice) void settle(key => onSetModelGroup(key, choice));
+              else {
+                const current = controls.models.find(route => route.backendId === controls.backend.backendId && route.providerId === controls.currentModel?.providerId && route.modelId === controls.currentModel?.modelId);
+                if (current) openModel(current);
+              }
+            }} />}
           {view.kind === "root" && <RootControls controls={controls} routes={routes} query={query}
             providerUsageTransport={providerUsageTransport} accountUsage={accountUsage}
             disabled={disabled} colors={colors} locale={locale} onQuery={setQuery} onOpenModel={openModel}

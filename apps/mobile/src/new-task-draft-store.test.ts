@@ -29,6 +29,19 @@ const authority = {
   createOperationId: "operation-create"
 };
 
+it("restores the original model group revision and the distinct Backend adopted by its task receipt", async () => {
+  const { driver } = memoryDriver(), store = new MobileNewTaskDraftStore(driver);
+  const taskModelGroup = { groupId: "work", revision: "4", targetId: "target", serverId: authority.serverId };
+  const draft = { targetId: "target", name: "Grouped task", input: input("Start"), taskModelGroup };
+  await store.beginSubmission(first, draft, authority);
+  const next = new MobileNewTaskDraftStore(driver);
+  expect((await next.read(first))?.submission).toMatchObject({ phase: "creating", taskModelGroup, backendId: authority.backendId });
+  await next.advanceToSending(first, authority.createOperationId, "task", 7n, { backendId: "other-backend", model: { ...authority.model, modelId: "group-model" } });
+  expect((await new MobileNewTaskDraftStore(driver).read(first))?.submission).toMatchObject({
+    phase: "sending", taskModelGroup, backendId: authority.backendId, adoptedBackendId: "other-backend", model: { modelId: "group-model" }
+  });
+});
+
 it("restores the selected Worktree and freezes its source through an unknown creation and an explicit failure", async () => {
   const { driver } = memoryDriver(), store = new MobileNewTaskDraftStore(driver);
   const worktree = { sourceRef: "refs/heads/review", refreshRemote: true };

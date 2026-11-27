@@ -5,7 +5,7 @@ import { redactSecrets, type PartnerGroupLane, type PartnerGroupPlan, type Partn
 import { PartnerGroupStore, PartnerStore, type OperationalStore, type PartnerProfileRecord } from "@joko/store";
 import type { PartnerGroupRuntime, PartnerGroupSession, PartnerGroupTurnResult } from "./partner-group-manager.js";
 import type { SessionHost } from "./session-host.js";
-import type { SessionRuntimeProfile } from "./session-runtime-control.js";
+import { nextPartnerFallback, type PartnerFallbackInput, type PartnerGroupRoutes } from "./partner-task-route.js";
 import type { WorkspaceService } from "./workspace-service.js";
 
 const STOP_SCOPE = "partner-group-runtime";
@@ -52,15 +52,12 @@ export class PartnerGroupSessionRuntime implements PartnerGroupRuntime {
     const plan = this.groups.getPlan(lane.planId), target = this.store.getTarget(session.targetId).descriptor;
     return plan.groupId === lane.groupId && plan.workDir !== null && target.workspaceRoot === plan.workDir && target.trusted && target.remoteWorkspace === undefined;
   }
-  fallback(input: { readonly sessionId: string; readonly current: SessionRuntimeProfile; readonly visitedRoutes: readonly string[]; readonly currentHop: number }) {
+  fallback(input: PartnerFallbackInput, groupRoutes?: PartnerGroupRoutes) {
     const lane = this.#lane(input.sessionId); if (!lane) return { owned: false };
     const profile = this.profiles.getPartner(lane.partnerId);
-    if (profile.lifecycle !== "active" || profile.initializationState !== "ready" || this.isHeld(input.sessionId)) return { owned: true };
+    if (profile.lifecycle !== "active" || profile.initializationState !== "ready" || this.isHeld(input.sessionId) || this.isRetiring(input.sessionId)) return { owned: true };
     const version = this.profiles.listProfileVersions(profile.id).find(item => item.version === lane.profileVersion);
-    const routes = version?.capabilities.modelChain ?? [];
-    const key = (route: SessionRuntimeProfile) => JSON.stringify([route.backendId, route.providerId, route.modelId]);
-    const visited = new Set([...input.visitedRoutes, key(input.current)]), index = routes.findIndex(route => key(route) === key(input.current));
-    const candidate = input.currentHop >= routes.length - 1 ? undefined : routes.slice(Math.max(0, index + 1)).find(route => !visited.has(key(route)));
+    const candidate = nextPartnerFallback(version?.capabilities.modelChain ?? [], input, groupRoutes);
     return candidate ? { owned: true, candidate } : { owned: true };
   }
   async recover(lanes: readonly PartnerGroupLane[]): Promise<void> {

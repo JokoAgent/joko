@@ -4553,7 +4553,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       input: { parts: draft.inputText.trim().length === 0 ? [] : [{ content: { case: "text", value: draft.inputText } }] },
       execution: {
         ...(!scriptMode && draft.providerId.length > 0 && draft.modelId.length > 0 ? { model: { model: { providerId: draft.providerId, modelId: draft.modelId }, effortId: draft.effort ?? "", ...encodeModelSpeed(draft.fastMode) } } : {}),
-        taskModelGroupId: !scriptMode && draft.providerId && draft.modelId ? draft.taskModelGroupId : undefined,
+        taskModelGroupId: scriptMode ? undefined : draft.taskModelGroupId,
         permissionMode: protoPermission(draft.permissionMode),
         planMode: !scriptMode && draft.planMode,
         useWorktree: draft.useWorktree,

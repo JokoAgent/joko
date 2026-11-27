@@ -122,6 +122,23 @@ function fixture(localMember = false, readRemote: ProviderGroupQuotaReaderOption
     revoke: () => { live = false; }, closeUnknown: (value: boolean) => { closeUnknown = value; }, completePoll: (error?: Error) => completePoll(error) };
 }
 
+it("opens the owner's prepared native member after the pick request completes", async () => {
+  const f = fixture();
+  const owner: HostedAgentPrincipal = { id: "paired-owner", deviceId: "source-device", trust: "owner", assertCurrent: f.principal.assertCurrent };
+  const group = { backendId: f.input.backendId, providerId: f.input.providerId }, request = new AbortController();
+  const pick = vi.spyOn(f.router, "pick");
+  const selected = await f.router.pick({ sessionId: JSON.stringify([owner.deviceId, f.input.sessionId]), group, profile: f.input,
+    agentKind: "pi", modelId: f.input.modelId, ownTask: false }, request.signal);
+  expect(selected.member.key).toBe("remote");
+  f.router.rememberRemoteSelection(owner.deviceId, f.input.sessionId, f.input.modelId, selected);
+  request.abort();
+  await f.endpoint.begin(owner, f.input);
+  await f.endpoint.call(owner, f.input.runId, "initial-state", { kind: "state" });
+  expect(f.opened).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ backendId: "native-remote", sessionId: f.input.sessionId, modelId: f.input.modelId }), expect.any(AbortSignal));
+  expect(pick).toHaveBeenCalledTimes(1);
+  expect(f.leases.count("remote")).toBe(0);
+});
+
 it.each(["model", "codex"])("selects the newly authorized device account for the next ordinary task using the same route and %s bucket", async bucketId => {
   let usedPercent = 100;
   const replies = vi.fn(() => ({ activeTurns: 0, accountUsage: toGroupAccountUsage({ providerId: "provider", observedAt: Date.now(),

@@ -1,4 +1,5 @@
 import type { MobilePlainStorageDriver } from "./connection-storage";
+import { mobileTaskModelGroupChoice, type MobileTaskModelGroupChoice } from "./mobile-task-model-groups";
 import { normalizeMobileObjectiveInput, type MobileObjectiveInput } from "./mobile-objective";
 import { normalizeMobileWorkerForm, type MobileWorkerForm } from "./mobile-collaboration";
 import {
@@ -15,11 +16,24 @@ export interface MobileNewTaskDraftIdentity {
 }
 
 export interface MobileNewTaskEditableDraft {
+  readonly taskModelGroup?: MobileNewTaskGroup;
   readonly collaboration?: MobileWorkerForm;
   readonly worktree?: MobileNewTaskWorktree;
   readonly targetId: string;
   readonly name: string;
   readonly input: MobileComposerDraft;
+}
+
+export interface MobileNewTaskGroup extends MobileTaskModelGroupChoice {
+  readonly targetId: string;
+  readonly serverId: string;
+}
+
+function normalizeGroup(value: unknown): MobileNewTaskGroup {
+  const choice = mobileTaskModelGroupChoice(value);
+  if (!isRecord(value) || typeof value.targetId !== "string" || typeof value.serverId !== "string") throw new Error("The model group owner changed.");
+  assertIdentity(value.targetId, "project"); assertIdentity(value.serverId, "node");
+  return { ...choice, targetId: value.targetId, serverId: value.serverId };
 }
 
 export interface MobileNewTaskWorktree {
@@ -35,6 +49,7 @@ export interface MobileNewTaskModelSelection {
 }
 
 interface MobileNewTaskSubmissionBase {
+  readonly taskModelGroup?: MobileNewTaskGroup;
   readonly collaboration?: MobileWorkerForm;
   readonly worktree?: MobileNewTaskWorktree;
   readonly objective?: MobileObjectiveInput;
@@ -55,6 +70,7 @@ export interface MobileNewTaskCreateSubmission extends MobileNewTaskSubmissionBa
 }
 
 export interface MobileNewTaskSendSubmission extends MobileNewTaskSubmissionBase {
+  readonly adoptedBackendId?: string;
   readonly firstInputAccepted?: true;
   readonly collaborationHandled?: boolean;
   readonly phase: "sending";
@@ -129,6 +145,11 @@ export class MobileNewTaskDraftStore {
     if (this.#cleared.has(key)) return null;
     const draft = this.#memory.get(key);
     return draft === undefined ? null : cloneDraft(draft);
+  }
+
+  readTaskModelGroup(identity: MobileNewTaskDraftIdentity): MobileNewTaskGroup | undefined {
+    const key = identityKey(identity), group = this.#memory.get(key)?.taskModelGroup;
+    return group && !this.#cleared.has(key) ? { ...group } : undefined;
   }
 
   async read(identity: MobileNewTaskDraftIdentity): Promise<MobileNewTaskDraft | null> {
@@ -307,6 +328,7 @@ export class MobileNewTaskDraftStore {
       targetId: editable.targetId,
       displayName,
       input: editable.input,
+      ...(editable.taskModelGroup ? { taskModelGroup: editable.taskModelGroup } : {}),
       ...(editable.worktree === undefined ? {} : { worktree: editable.worktree })
     });
     await this.#replace(exact, { ...editable, submission });
@@ -317,7 +339,8 @@ export class MobileNewTaskDraftStore {
     identity: MobileNewTaskDraftIdentity,
     createOperationId: string,
     sessionId: string,
-    runtimeGeneration: bigint
+    runtimeGeneration: bigint,
+    adopted?: { backendId: string; model: MobileNewTaskModelSelection }
   ): Promise<MobileNewTaskSendSubmission> {
     const exact = normalizeIdentity(identity);
     const current = this.#required(exact);
@@ -330,6 +353,7 @@ export class MobileNewTaskDraftStore {
     const next = normalizeSubmission({
       ...submission,
       phase: "sending",
+      ...(adopted && submission.taskModelGroup ? { adoptedBackendId: adopted.backendId, model: adopted.model } : {}),
       sessionId,
       runtimeGeneration: runtimeGeneration.toString(10)
     }) as MobileNewTaskSendSubmission;
@@ -586,6 +610,7 @@ function normalizeEditableDraft(value: MobileNewTaskEditableDraft): MobileNewTas
   if (value.name.length > 256) throw new Error("The local Joko task name is too long.");
   const input = normalizeNewTaskInput(value.input);
   return { targetId: value.targetId, name: value.name, input,
+    ...(value.taskModelGroup?.targetId === value.targetId ? { taskModelGroup: normalizeGroup(value.taskModelGroup) } : {}),
     ...(value.worktree === undefined ? {} : { worktree: normalizeMobileNewTaskWorktree(value.worktree) }),
     ...(value.collaboration === undefined ? {} : { collaboration: normalizeMobileWorkerForm(value.collaboration) }) };
 }
@@ -624,6 +649,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
     throw new Error("The retained Joko first message is invalid.");
   }
   const base: MobileNewTaskSubmissionBase = {
+    ...(value.taskModelGroup === undefined ? {} : { taskModelGroup: normalizeGroup(value.taskModelGroup) }),
     ...(value.worktree === undefined ? {} : { worktree: normalizeMobileNewTaskWorktree(value.worktree) }),
     ...(value.collaboration === undefined ? {} : { collaboration: normalizeMobileWorkerForm(value.collaboration) }),
     ...(value.objective === undefined ? {} : { objective: normalizeMobileObjectiveInput(value.objective) }),
@@ -638,7 +664,13 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
     model: normalizeNewTaskModelSelection(value.model),
     input
   };
+  if (base.taskModelGroup && (base.taskModelGroup.serverId !== base.serverId || base.taskModelGroup.targetId !== base.targetId)) throw new Error("The saved model group belongs to another project or node.");
   if (value.phase === "creating") return { phase: "creating", ...base };
+  if (value.taskModelGroup && (value.adoptedBackendId === undefined || !base.model)) throw new Error("The accepted model group route is missing.");
+  if (value.adoptedBackendId !== undefined) {
+    if (!value.taskModelGroup) throw new Error("The task has no model group.");
+    assertIdentity(value.adoptedBackendId, "adopted Backend");
+  }
   assertIdentity(value.sessionId, "task");
   positiveDecimal(value.runtimeGeneration, "task runtime generation");
   if (value.sendOperationId !== undefined) assertIdentity(value.sendOperationId, "first-message operation");
@@ -652,6 +684,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
     phase: "sending",
     ...base,
     sessionId: value.sessionId,
+    ...(value.adoptedBackendId === undefined ? {} : { adoptedBackendId: value.adoptedBackendId }),
     runtimeGeneration: value.runtimeGeneration,
     ...(value.firstInputAccepted ? { firstInputAccepted: true } : {}),
     ...(value.collaborationHandled === undefined ? {} : { collaborationHandled: true }),
@@ -692,6 +725,7 @@ function readRecord(serialized: string, identity: MobileNewTaskDraftIdentity): M
     targetId: draft["targetId"],
     name: draft["name"],
     input: draft["input"] as unknown as MobileComposerDraft,
+    ...(draft["taskModelGroup"] === undefined ? {} : { taskModelGroup: normalizeGroup(draft["taskModelGroup"]) }),
     ...(draft["worktree"] === undefined ? {} : { worktree: normalizeMobileNewTaskWorktree(draft["worktree"]) }),
     ...(draft["collaboration"] === undefined ? {} : { collaboration: draft["collaboration"] as unknown as MobileWorkerForm })
   });
@@ -715,6 +749,7 @@ function cloneDraft(draft: MobileNewTaskDraft): MobileNewTaskDraft {
 function cloneSubmission(submission: MobileNewTaskSubmission): MobileNewTaskSubmission {
   return {
     ...submission,
+    ...(submission.taskModelGroup === undefined ? {} : { taskModelGroup: { ...submission.taskModelGroup } }),
     ...(submission.worktree === undefined ? {} : { worktree: normalizeMobileNewTaskWorktree(submission.worktree) }),
     ...(submission.objective === undefined ? {} : { objective: normalizeMobileObjectiveInput(submission.objective) }),
     ...(submission.collaboration === undefined ? {} : { collaboration: normalizeMobileWorkerForm(submission.collaboration) }),
@@ -730,6 +765,7 @@ function persistedSubmission(submission: MobileNewTaskSubmission): Omit<MobileNe
 
 function sameDraft(left: MobileNewTaskDraft, right: MobileNewTaskDraft): boolean {
   return left.targetId === right.targetId && left.name === right.name
+    && JSON.stringify(left.taskModelGroup) === JSON.stringify(right.taskModelGroup)
     && JSON.stringify(left.worktree) === JSON.stringify(right.worktree)
     && JSON.stringify(left.collaboration) === JSON.stringify(right.collaboration)
     && JSON.stringify(left.conversation) === JSON.stringify(right.conversation)
@@ -741,6 +777,7 @@ function sameDraft(left: MobileNewTaskDraft, right: MobileNewTaskDraft): boolean
 
 function cloneEditableDraft(draft: MobileNewTaskEditableDraft): MobileNewTaskEditableDraft {
   return { targetId: draft.targetId, name: draft.name, input: cloneMobileComposerDraft(draft.input),
+    ...(draft.taskModelGroup === undefined ? {} : { taskModelGroup: { ...draft.taskModelGroup } }),
     ...(draft.worktree === undefined ? {} : { worktree: normalizeMobileNewTaskWorktree(draft.worktree) }),
     ...(draft.collaboration === undefined ? {} : { collaboration: normalizeMobileWorkerForm(draft.collaboration) }) };
 }
@@ -761,6 +798,8 @@ function sameSubmission(left: MobileNewTaskSubmission, right: MobileNewTaskSubmi
     || left.backendId !== right.backendId || left.targetId !== right.targetId
     || left.targetRevision !== right.targetRevision || left.targetRevisionEtag !== right.targetRevisionEtag
     || left.createOperationId !== right.createOperationId || left.displayName !== right.displayName
+    || JSON.stringify(left.taskModelGroup) !== JSON.stringify(right.taskModelGroup)
+    || left.phase === "sending" && right.phase === "sending" && left.adoptedBackendId !== right.adoptedBackendId
     || JSON.stringify(left.worktree) !== JSON.stringify(right.worktree)
     || !sameNewTaskModelSelection(left.model, right.model)
     || !mobileComposerDraftsEqual(left.input, right.input)) return false;

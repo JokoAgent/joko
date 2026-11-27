@@ -1,9 +1,26 @@
 import { expect, it } from "vitest";
+import { ProviderGroupLeases } from "./provider-group-leases.js";
 import { selectProviderGroupMember, type ProviderGroupCandidate, type ProviderGroupStrategy } from "./provider-group-scheduler.js";
 
 const now = 1_700_000_000_000;
 const member = (id: string, patch: Partial<ProviderGroupCandidate> = {}): ProviderGroupCandidate => ({ id, available: true, paused: false, running: 0, capacity: 4, weight: 1, ...patch });
 const strategies: ProviderGroupStrategy[] = ["least_busy", "round_robin", "ordered", "weighted"];
+
+it("keeps the new member at capacity when an older assignment reports the same session", () => {
+  const leases = new ProviderGroupLeases(() => now);
+  const previous = { sessionId: "controller/task", memberKey: "a", backendId: "pi", providerId: "first" };
+  const next = { ...previous, memberKey: "b", providerId: "second" };
+  leases.report("controller", 1n, [previous]);
+  leases.reserve(next);
+  const pick = () => selectProviderGroupMember([member("b", { capacity: 1, running: leases.count("b") })], "ordered", { now });
+  expect(pick()).toBeUndefined();
+  leases.report("controller", 2n, [previous]);
+  expect(pick()).toBeUndefined();
+  leases.report("controller", 3n, [next]);
+  expect(leases.count("b")).toBe(1);
+  leases.report("controller", 4n, []);
+  expect(pick()).toBe("b");
+});
 
 it("uses the highest credible remaining-quota pace for every strategy", () => {
   const candidates = [member("unknown"), member("fresh", { urgency: 1 }), member("nearly-full", { urgency: 12, fiveHourTight: true }),

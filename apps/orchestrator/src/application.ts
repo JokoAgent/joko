@@ -2092,12 +2092,17 @@ export async function createOrchestratorApplication(
       ),
     sessionRuntimeFallbackEnabled: () => configuredSessionRuntimeFallback(store),
     serviceSessionRuntimeFallback: (input) => {
-      const task = partnerSessionTasks?.fallback(input);
-      const group = partnerGroupRuntime?.fallback(input);
-      const routine = partners.routineFallback(input);
-      return task?.owned ? task : group?.owned ? group : routine.owned ? routine : partnerSessionRuntimeFallback(partnerStore, input,
-        groupId => store.getTarget(store.getSession(input.sessionId).descriptor.targetId).descriptor.remoteWorkspace === undefined
-          ? providerGroups?.taskModels.localFallbacks(groupId) ?? [] : []);
+      const localGroupRoutes = (groupId: string) => {
+        const session = store.getSession(input.sessionId).descriptor, target = store.getTarget(session.targetId).descriptor;
+        return target.trusted && target.remoteWorkspace === undefined && session.remoteWorkspace === undefined
+          ? providerGroups?.taskModels.localFallbacks(groupId) : undefined;
+      };
+      const task = partnerSessionTasks?.fallback(input, localGroupRoutes);
+      if (task?.owned) return task;
+      const group = partnerGroupRuntime?.fallback(input, localGroupRoutes);
+      if (group?.owned) return group;
+      const routine = partners.routineFallback(input, localGroupRoutes);
+      return routine.owned ? routine : partnerSessionRuntimeFallback(partnerStore, input, localGroupRoutes);
     },
     partnerSessionRetiring: (sessionId) => partnerStore.isPartnerSessionRetiring(sessionId)
       || partners.isRoutineSessionRetiring(sessionId)

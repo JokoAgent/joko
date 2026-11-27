@@ -21,19 +21,21 @@ import { createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { createProviderGroupConnectService } from "./provider-group-connect-service.js";
 import { isOfficialOpenAiKeyModel, localOpenAiPoolKey, type LocalOpenAiAccountIdentity } from "./local-openai-pool.js";
-import type { ProviderDescriptor } from "./credential-manager.js";
 import { ProviderGroupRemoteRouter } from "./provider-group-remote.js";
 import { toProtoQueueItem } from "./proto-mapper.js";
 import { mkdtemp } from "./test-paths.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanups.splice(0)) await close(); });
-async function fixture(taskModels = false, openAiAccount?: (backend: string, provider: string, model: string) => LocalOpenAiAccountIdentity | undefined) {
+async function fixture(taskModels = false, openAiAccount?: (backend: string, provider: string, model: string) => LocalOpenAiAccountIdentity | undefined,
+  extraBackendId?: string) {
   const root = await mkdtemp(join(tmpdir(), "joko-group-host-")), store = new OperationalStore(join(root, "store.db"));
   const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
   const profile = { ...PI_LIKE_PROFILE, capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes" ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability) };
   const first = new FakeBackendAdapter({ ...profile, id: "group-first" }), second = new FakeBackendAdapter({ ...profile, id: "group-second" });
-  const registry = new BackendInstanceRegistry(store); await registry.provision([first, second].map((adapter, index) => ({
+  const adapters = [first, second];
+  if (extraBackendId !== undefined) adapters.push(new FakeBackendAdapter({ ...profile, id: extraBackendId }));
+  const registry = new BackendInstanceRegistry(store); await registry.provision(adapters.map((adapter, index) => ({
     instanceId: adapter.id, adapterKind: taskModels ? index === 0 ? "codex" : "pi" : "fake", displayName: adapter.id, create: () => adapter
   })));
   const host = new SessionHost(store, artifacts, registry.availableAdapters(), { backendDescriptors: registry.descriptors(), backendDescriptorsAlreadyPublished: true }); await host.initialize();
@@ -53,14 +55,18 @@ const prompt = (text: string): PromptInput => ({ text, images: [], files: [], me
 
 it("admits only authenticated official Responses API keys for the requested wire model", () => {
   const key = { enabled: true, authenticationState: "authenticated", kind: "custom_endpoint", credentialOrigin: "https://api.openai.com",
-    provider: { id: "custom", baseUrl: "https://api.openai.com/v1/", api: "openai-responses", apiKeyEnv: "TEST_KEY", models: [{ id: "exact" }] } } as ProviderDescriptor;
+    provider: { id: "custom", baseUrl: "https://api.openai.com/v1/", api: "openai-responses", apiKeyEnv: "TEST_KEY", models: [{ id: "exact" }] } } satisfies Parameters<typeof isOfficialOpenAiKeyModel>[0];
   expect(isOfficialOpenAiKeyModel(key, "exact")).toBe(true);
+  expect(isOfficialOpenAiKeyModel({ ...key, requestPath: "/v1/responses", provider: { ...key.provider,
+    headers: { "OpenAI-Project": { env: "PROJECT" }, "OpenAI-Organization": { env: "ORG" } } } }, "exact")).toBe(true);
+  expect(isOfficialOpenAiKeyModel({ ...key, provider: { ...key.provider, headers: { Authorization: { env: "OTHER" } } } }, "exact")).toBe(false);
   expect(isOfficialOpenAiKeyModel(key, "alias")).toBe(false);
   for (const baseUrl of ["https://other.test/v1", "https://api.openai.com/v1?override=1", "https://api.openai.com/v2"]) {
     expect(isOfficialOpenAiKeyModel({ ...key, provider: { ...key.provider, baseUrl } }, "exact")).toBe(false);
   }
   expect(isOfficialOpenAiKeyModel({ ...key, provider: { ...key.provider, models: [{ id: "exact", baseUrl: "https://other.test/v1" }] } }, "exact")).toBe(false);
   expect(isOfficialOpenAiKeyModel({ ...key, requestPath: "/chat/completions" }, "exact")).toBe(false);
+  expect(isOfficialOpenAiKeyModel({ ...key, requestPath: "/responses" }, "exact")).toBe(false);
 });
 
 it("opts a local subscription into an exact account pool, switches its owned send and keeps the pool private", async () => {
@@ -91,6 +97,58 @@ it("opts a local subscription into an exact account pool, switches its owned sen
   expect(f.groups.store.bindingRecord(sessionId)?.released).toBe(true);
 });
 async function until(predicate: () => boolean): Promise<void> { await vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 8000, interval: 10 }); }
+
+it("keeps account priority, settings and task bindings when the owner confirms the same local pool membership again", async () => {
+  const third = { backendId: "group-third", providerId: "test" };
+  const f = await fixture(false, (backend, provider, model) => provider === "test" && model === "text"
+    ? { kind: backend === "group-first" ? "subscription" : "key", generation: backend } : undefined, third.backendId);
+  const client = createClient(contract.ProviderGroupService, createRouterTransport(router => router.service(contract.ProviderGroupService,
+    createProviderGroupConnectService(f.groups.connectOptions(() => ({ id: "owner", management: true, trust: "owner", assertCurrent() {} }))))));
+  const second = { backendId: f.second.id, providerId: "test" }, key = localOpenAiPoolKey(f.key);
+  const set = (source: typeof second, included: boolean, expectedRevision: bigint) =>
+    client.setLocalOpenAiPoolMember({ target: f.key, source, included, expectedRevision });
+  await set(second, true, 0n);
+  const task = (await f.create("keep-pool-binding")).value.sessionId;
+  const binding = f.groups.store.binding(task);
+  expect(binding?.backendId).toBe(f.first.id);
+  const firstPair = f.groups.store.snapshot(key);
+  const settings = { strategy: "weighted" as const, autoSwitch: false, members: firstPair.config!.members.map(member =>
+    member.backendId === second.backendId ? { ...member, capacity: 2, unlimitedCapacity: false, weight: 3, paused: true } : member) };
+  const configured = f.groups.store.update(key, settings, firstPair.revision);
+  await set(third, true, configured.revision);
+  const before = f.groups.store.snapshot(key);
+  expect(before.config).toMatchObject({ strategy: "weighted", autoSwitch: false });
+  expect(before.config!.members.map(member => member.backendId)).toEqual([f.first.id, f.second.id, third.backendId]);
+  await expect(set(second, true, configured.revision)).rejects.toThrow();
+  expect((await set(second, true, before.revision)).pool?.revision).toBe(before.revision);
+  expect(f.groups.store.snapshot(key)).toEqual(before);
+  expect(f.groups.store.binding(task)).toEqual(binding);
+  const after = (await set(third, false, before.revision)).pool!;
+  expect(f.groups.store.snapshot(key).config).toEqual(settings);
+  expect((await set(third, false, after.revision)).pool?.revision).toBe(after.revision);
+});
+
+it.each([
+  { code: "USAGE_LIMIT", message: "Subscription quota exhausted", cause: "usage-limit" },
+  { code: "AUTHENTICATION_FAILED", message: "OAuth token has expired", cause: "auth" }
+])("continues a settled local account $cause on the opted-in official Key once", async failure => {
+  const f = await fixture(false, (backend, provider, model) => model === "text" && provider === "test"
+    ? { kind: backend === "group-first" ? "subscription" : "key", generation: backend } : undefined);
+  f.groups.localOpenAiPools.set(f.key, { backendId: f.second.id, providerId: "test" }, true, 0n);
+  const sessionId = (await f.create("local-pool")).value.sessionId;
+  const first = vi.spyOn(f.first, "send").mockImplementationOnce(async (_input, context) => {
+    await context.emit({ type: "error", terminal: true, error: { code: failure.code, message: failure.message,
+      phase: "turn", retryable: false, stateMayHaveChanged: false, recovery: "Check the original account." } });
+    await context.emit({ type: "done", outcome: "failed" });
+  });
+  const second = vi.spyOn(f.second, "send");
+  const queued = f.send(sessionId, "local-pool-send", "use the original input");
+  await until(() => f.store.listRuns({ sessionId }).some(run => run.descriptor.parentRunId === queued.runId && run.descriptor.state === "completed"));
+  expect(first).toHaveBeenCalledOnce(); expect(second).toHaveBeenCalledOnce();
+  expect(second.mock.calls[0]![0].text).toContain("use the original input");
+  expect(f.groups.store.cooling(localOpenAiPoolKey(f.key), Date.now())).toMatchObject([{ memberKey: f.members[0]!.key, cause: failure.cause }]);
+  expect(f.store.getSession(sessionId).descriptor).toMatchObject({ targetId: "target", backendId: f.second.id });
+});
 
 function taskModelGroup(f: Awaited<ReturnType<typeof fixture>>, strategy: contract.TaskModelGroupStrategy, firstWeight?: number) {
   const sources = f.groups.taskModels.list().sources;
@@ -140,7 +198,12 @@ it("rotates across exact accounts and Backends after first input, and binds the 
   expect(f.store.getSession(exact).descriptor).toMatchObject({ backendId: f.first.id, providerId: "test", modelId: "text" });
 });
 
-it("resolves a saved Partner route and a persistent Schedule on their owner, retaining the adopted occurrence route", async () => {
+function groupedScheduleSnapshot(fallback?: { providerId: string; modelId: string; effort?: string }) {
+  return withScheduleExtensionSnapshot({ taskModelGroupId: "work", permissionMode: "ask", planMode: false,
+    useWorktree: false, refreshWorktreeRemote: false, extraDirectoryIds: [], ...fallback }, defaultScheduleExtensionSnapshot());
+}
+
+it.each([true, false])("resolves Partner and persistent Schedule groups on their owner with a saved fallback %s", async savedFallback => {
   const f = await fixture(true);
   const group = taskModelGroup(f, contract.TaskModelGroupStrategy.ROUND_ROBIN);
   const partner = { operationId: "partner-group-first", serviceKind: "partner" as const, targetId: "target", title: "Partner",
@@ -151,8 +214,7 @@ it("resolves a saved Partner route and a persistent Schedule on their owner, ret
   expect((await group.preview()).selected?.source).toEqual(group.image);
   f.store.upsertSchedule({ id: "grouped-schedule", backendId: f.first.id, targetId: "target", sessionMode: "persistent",
     name: "Grouped job", kind: "manual", timezone: "UTC", enabled: true, prompt: prompt("Run once"),
-    executionSnapshot: withScheduleExtensionSnapshot({ taskModelGroupId: "work", providerId: "test", modelId: "text", permissionMode: "ask",
-      useWorktree: false, refreshWorktreeRemote: false }, defaultScheduleExtensionSnapshot()),
+    executionSnapshot: groupedScheduleSnapshot(savedFallback ? { providerId: "test", modelId: "text" } : undefined),
     overlapPolicy: "queue", misfirePolicy: "run_once" });
   const scheduler = new ScheduleCoordinator(f.store, f.host);
   try {
@@ -172,6 +234,41 @@ it("resolves a saved Partner route and a persistent Schedule on their owner, ret
     const plain = await f.host.createServiceSession({ ...partner, operationId: "deleted-group-partner" });
     expect(f.store.getSession(plain.value.sessionId).descriptor).toMatchObject({ backendId: f.first.id, modelId: "text" });
     expect(f.groups.taskModels.binding(plain.value.sessionId)).toBeUndefined();
+    const nativeStart = vi.spyOn(f.first, "createSession");
+    f.store.upsertSchedule({ id: "deleted-group", backendId: f.first.id, targetId: "target", sessionMode: "fresh",
+      name: "Deleted group", kind: "manual", timezone: "UTC", enabled: true, prompt: prompt("Use the fallback"),
+      executionSnapshot: groupedScheduleSnapshot(savedFallback ? { providerId: "vision", modelId: "multimodal" } : undefined),
+      overlapPolicy: "queue", misfirePolicy: "run_once" });
+    const fallback = await scheduler.runNowWithResult("deleted-group", "fallback-fire");
+    expect(fallback.status, JSON.stringify(f.store.findScheduleRunByRunId(fallback.runId)?.detail)).toBe("queued");
+    expect(f.store.getSession(fallback.sessionId!).descriptor).toMatchObject({ targetId: "target", backendId: f.first.id });
+    expect(nativeStart).toHaveBeenCalledOnce();
+    expect(nativeStart.mock.calls[0]![0].modelId).toBe(savedFallback ? "multimodal" : undefined);
+    expect(f.groups.taskModels.binding(fallback.sessionId!)).toBeUndefined();
+    await until(() => f.store.findQueueItemByRunId(fallback.sessionId!, fallback.runId, { includeCleared: true })?.state === "completed");
+  } finally { scheduler.stop(); }
+});
+
+it("keeps a bound group Schedule on its current task even when the saved fallback has an effort and the task has none", async () => {
+  const f = await fixture(true);
+  taskModelGroup(f, contract.TaskModelGroupStrategy.DRAIN);
+  const created = await f.host.createSession({ operationId: "native-default", connection: f.connection,
+    targetId: "target", title: "Native task", permissionMode: "ask", planMode: false, fastMode: false });
+  const session = f.store.getSession(created.value.sessionId).descriptor;
+  expect(session.effort).toBeUndefined();
+  f.store.upsertSchedule({ id: "bound-group", backendId: f.first.id, targetId: "target", sessionMode: "bound", sessionId: session.id,
+    name: "Bound group", kind: "manual", timezone: "UTC", enabled: true, prompt: prompt("Continue here"),
+    executionSnapshot: groupedScheduleSnapshot({ providerId: "vision", modelId: "multimodal", effort: "high" }),
+    overlapPolicy: "queue", misfirePolicy: "run_once" });
+  const scheduler = new ScheduleCoordinator(f.store, f.host);
+  try {
+    const result = await scheduler.runNowWithResult("bound-group", "bound-group-fire");
+    expect(result, JSON.stringify(f.store.findScheduleRunByRunId(result.runId)?.detail)).toMatchObject({ sessionId: session.id, status: "queued" });
+    const item = () => f.store.findQueueItemByRunId(session.id, result.runId, { includeCleared: true });
+    expect(item()?.executionOverrides?.effort).toBeUndefined();
+    expect(item()?.executionOverrides?.modelId).toBe(session.modelId);
+    await until(() => item()?.state === "completed");
+    expect(f.store.getSession(session.id).descriptor.backendId).toBe(f.first.id);
   } finally { scheduler.stop(); }
 });
 
@@ -214,6 +311,42 @@ it("uses the tightest live long window for headroom, keeping group order on ties
   expect((await group.preview()).selected?.source).toEqual(group.text);
   firstUsed = 31;
   expect((await group.preview()).selected?.source).toEqual(group.image);
+});
+
+it("uses a live subscription quota without a reset time for lowest cost and never charges the subscription its listed model price", async () => {
+  const f = await fixture(true);
+  const current = f.registry.descriptors.bind(f.registry);
+  vi.spyOn(f.registry, "descriptors").mockImplementation(() => current().map(backend => backend.id !== f.second.id ? backend : {
+    ...backend, providers: [{ providerId: "vision", displayName: "Vision subscription", accessKind: "subscription", accessProduct: "Vision",
+      api: "test", authenticationState: "authenticated", loginMethods: [], supportsLogin: false, supportsLogout: false,
+      supportsRefresh: false, supportsModelRefresh: false }]
+  }));
+  f.store.upsertModelPriceOverride({ ownerId: "group-node", backendId: f.first.id, providerId: "test", modelId: "text",
+    values: { currencyCode: "USD", input: 1, output: 2, cacheRead: null, cacheWrite: null }, updatedAt: Date.now() });
+  const group = taskModelGroup(f, contract.TaskModelGroupStrategy.LOWEST_COST);
+  expect((await group.preview()).selected?.source).toEqual(group.text);
+  vi.spyOn(f.groups.directory.options.quotas.options, "readLocal").mockImplementation(async member =>
+    member.backendId === f.second.id ? { providerId: "vision", observedAt: Date.now(), primaryWindow: { windowMinutes: 300, usedPercent: 20 } } : undefined);
+  expect((await group.preview()).selected?.source).toEqual(group.image);
+  const created = await group.create("live-subscription-no-reset");
+  expect(f.store.getSession(created.value.sessionId).descriptor).toMatchObject({ backendId: f.second.id, targetId: "target", modelId: "multimodal" });
+});
+
+it("expands the active Partner group first and visits the original group's other time windows in saved order", async () => {
+  const f = await fixture(true), groups = f.groups.taskModels;
+  vi.spyOn(groups.options, "now").mockReturnValue(new Date(2026, 10, 20, 10).getTime());
+  const sources = groups.list().sources.map(row => row.source!);
+  const route = (groupId: string, backendId: string, modelId: string, schedules: { startHour: number; endHour: number; useGroupId: string }[] = []) =>
+    message(contract.TaskModelGroupSchema, { groupId, name: groupId, strategy: contract.TaskModelGroupStrategy.ORDERED,
+      candidates: [{ source: sources.find(source => source.backendId === backendId && source.modelId === modelId)! }], schedules });
+  groups.save(0n, [
+    route("base", f.first.id, "text", [{ startHour: 9, endHour: 12, useGroupId: "morning" }, { startHour: 14, endHour: 16, useGroupId: "afternoon" }]),
+    route("morning", f.second.id, "text", [{ startHour: 1, endHour: 3, useGroupId: "early" }]),
+    route("afternoon", f.first.id, "multimodal"), route("early", f.second.id, "multimodal")
+  ]);
+  expect(groups.localFallbacks("base")?.map(profile => [profile.backendId, profile.modelId])).toEqual([
+    [f.second.id, "text"], [f.first.id, "text"], [f.first.id, "multimodal"], [f.second.id, "multimodal"]
+  ]);
 });
 
 it("selects a model group on an existing task and holds a new input until the chosen Backend owns it", async () => {
@@ -608,7 +741,7 @@ it("keeps an admitted ask-only permission override while switching an unavailabl
 });
 
 it("reserves only open computer slots and reports saturation through the owner route until release", async () => {
-  const f = await fixture(), members = f.members.map(member => ({ ...member, capacity: 1 }));
+  const f = await fixture(), members = f.members.map(member => ({ ...member, capacity: 1, unlimitedCapacity: false }));
   f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members }, 0n);
   const [a, b] = members.map(member => member.key) as [string, string];
   const signal = new AbortController().signal;
@@ -644,6 +777,97 @@ it("reserves only open computer slots and reports saturation through the owner r
   const remaining = await pick("remaining", new Set([b]));
   await expect(pick("no-spare", new Set([b]))).rejects.toMatchObject({ full: true });
   remaining.release();
+});
+
+it("keeps unreported peer picks charged, releases a replaced selection, and accepts only newer running snapshots", async () => {
+  const f = await fixture();
+  const members = f.members.map(member => ({ ...member, capacity: 1, unlimitedCapacity: false }));
+  f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members }, 0n);
+  const [a, b] = members.map(member => member.key) as [string, string];
+  const peer = (id: string) => createClient(contract.ProviderGroupService, createRouterTransport(router => router.service(
+    contract.ProviderGroupService, createProviderGroupConnectService(f.groups.connectOptions(() => ({ id, management: false, trust: "owner", assertCurrent() {} }))))));
+  const original = peer("first-computer"), other = peer("second-computer");
+  const pick = async (client: typeof original, sessionId: string, excludeMemberKeys: string[] = []) =>
+    (await client.pickProviderGroupMember({ key: f.key, sessionId, agentKind: "fake", modelId: "text", excludeMemberKeys })).member!.key;
+  const counts = () => members.map(member => f.groups.leases.count(member.key));
+  expect(await pick(original, "one")).toBe(a);
+  expect((await original.reportProviderGroupLeases({ sequence: 1n, leases: [] })).accepted).toBe(true);
+  expect(counts()).toEqual([1, 0]);
+  expect(await pick(original, "one", [a])).toBe(b);
+  expect(counts()).toEqual([0, 1]);
+  expect(await pick(other, "one")).toBe(a);
+  expect(counts()).toEqual([1, 1]);
+  await expect(pick(original, "blocked")).rejects.toThrow(/are at capacity/i);
+  await original.reportProviderGroupLeases({ sequence: 2n, leases: [{ sessionId: "one", memberKey: b }] });
+  expect((await original.reportProviderGroupLeases({ sequence: 1n, leases: [] })).accepted).toBe(false);
+  expect(counts()).toEqual([1, 1]);
+  await original.reportProviderGroupLeases({ sequence: 3n, leases: [] });
+  expect(counts()).toEqual([1, 0]);
+  expect(await pick(original, "after-release")).toBe(b);
+
+  const profile = { ...f.key, modelId: "text", fastMode: false }, admission = new AbortController();
+  const adopted = f.groups.router.takeRemoteSelection("second-computer", "one", profile, admission.signal);
+  expect(adopted?.member.key).toBe(a);
+  adopted!.assertCurrent();
+  admission.abort();
+  expect(() => adopted!.assertCurrent()).toThrow();
+  adopted!.release();
+  expect(counts()).toEqual([0, 1]);
+  const next = new AbortController().signal;
+  for (const change of [{ modelId: "other" }, { effort: "high" }, { fastMode: true }]) {
+    expect(await pick(other, "changed-profile")).toBe(a);
+    expect(f.groups.router.takeRemoteSelection("second-computer", "changed-profile", { ...profile, ...change }, next)).toBeUndefined();
+    expect(counts()).toEqual([0, 1]);
+  }
+  f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: false, members }, 1n);
+  expect(() => f.groups.router.takeRemoteSelection("first-computer", "after-release", profile, next)).toThrow();
+  expect(counts()).toEqual([0, 0]);
+
+  let now = f.groups.leases.now();
+  vi.spyOn(f.groups.leases, "now").mockImplementation(() => now);
+  const running = [{ sessionId: "running", memberKey: a }];
+  const report = (sequence: bigint) => original.reportProviderGroupLeases({ sequence, leases: running });
+  expect((await report(5n)).accepted).toBe(true);
+  expect(await pick(other, "before-expiry")).toBe(b);
+  now += 150_000;
+  expect(counts()).toEqual([1, 0]);
+  now += 1;
+  expect(counts()).toEqual([0, 0]);
+  expect((await report(4n)).accepted).toBe(false);
+  expect((await report(5n)).accepted).toBe(false);
+  expect(await pick(other, "after-expiry")).toBe(a);
+  expect((await original.reportProviderGroupLeases({ sequence: 6n, leases: [{ sessionId: "running", memberKey: b }] })).accepted).toBe(true);
+  await expect(pick(other, "full-again")).rejects.toThrow(/are at capacity/i);
+  expect((await original.reportProviderGroupLeases({ sequence: 7n, leases: [] })).accepted).toBe(true);
+  expect(await pick(other, "after-new-release")).toBe(b);
+});
+
+it("distinguishes an unset limit from an explicit four when the owner reads, edits and reserves", async () => {
+  const f = await fixture();
+  const owner = createClient(contract.ProviderGroupService, createRouterTransport(router => router.service(contract.ProviderGroupService,
+    createProviderGroupConnectService(f.groups.connectOptions(() => ({ id: "owner", trust: "owner", management: true, assertCurrent() {} }))))));
+  const listed = await owner.listProviderGroupCandidates({ key: f.key });
+  const member = listed.candidates.find(row => row.member?.backendId === f.first.id)!.member!;
+  expect(member).toMatchObject({ capacity: 4, unlimitedCapacity: true });
+  let revision = 0n;
+  const save = async (unlimitedCapacity: boolean | undefined) => {
+    const result = await owner.updateProviderGroup({ key: f.key, expectedRevision: revision, update: { case: "config", value: {
+      strategy: contract.ProviderGroupStrategy.ORDERED, autoSwitch: true, members: [{ ...member, unlimitedCapacity }]
+    } } });
+    revision = result.group!.revision;
+    return result.group!.config!.members[0]!;
+  };
+  vi.spyOn(f.groups.directory.options, "running").mockReturnValue(4);
+  const pick = () => f.groups.router.pick({ group: f.key, sessionId: "fifth", agentKind: "fake", modelId: "text", ownTask: true,
+    profile: { ...f.key, modelId: "text", fastMode: false } }, new AbortController().signal);
+  await save(undefined);
+  await expect(pick()).rejects.toMatchObject({ code: "PROVIDER_GROUP_FULL" });
+  await save(true);
+  expect((await save(undefined)).unlimitedCapacity).toBe(true);
+  const fifth = await pick();
+  expect(fifth.member.key).toBe(member.key); fifth.release();
+  await save(false);
+  await expect(pick()).rejects.toMatchObject({ code: "PROVIDER_GROUP_FULL" });
 });
 
 it("keeps unknown computer quotas in order and filters measured pace, tight windows and exclusions before reserving", async () => {

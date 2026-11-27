@@ -51,7 +51,8 @@ describe("Schedule editor isolated workspace controls", () => {
       workspaces: [workspace]
     };
     const controller = {
-      state: { snapshot, preferences: { navigationOpen: true } },
+      state: { snapshot, activeProfile: { id: "owner", serverId: "server" }, preferences: { navigationOpen: true } },
+      providerGroups: { taskModels: { list: async () => ({ config: { groups: [{ groupId: "work", name: "Work" }] } }) } },
       getSchedulerRuntime: async () => ({
         instanceId: "scheduler-test",
         inFlight: 0,
@@ -80,6 +81,7 @@ describe("Schedule editor isolated workspace controls", () => {
     await act(async () => setValue(source, "refs/heads/release", "change"));
     const refresh = isolation.querySelector<HTMLInputElement>(".new-task-worktree__refresh input")!;
     await act(async () => refresh.click());
+    await act(async () => setValue(findSelectByLabel(container, "Model groups"), "work", "change"));
     await act(async () => setValue(findInputByLabel(container, "Name"), "Release review", "input"));
     await act(async () => setValue(container.querySelector<HTMLTextAreaElement>("textarea")!, "Inspect the release branch", "input"));
 
@@ -92,6 +94,9 @@ describe("Schedule editor isolated workspace controls", () => {
       enabled: true,
       sessionMode: "fresh",
       executionMode: "agent",
+      taskModelGroupId: "work",
+      providerId: "",
+      modelId: "",
       useWorktree: true,
       worktreeSourceRef: "refs/heads/release",
       refreshWorktreeRemote: true

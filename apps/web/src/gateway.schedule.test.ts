@@ -172,6 +172,7 @@ describe("schedule gateway snapshots", () => {
       scriptDispatchSessions: true,
       providerId: "provider-must-not-dispatch",
       modelId: "model-must-not-dispatch",
+      taskModelGroupId: "work",
       fastMode: true,
       permissionMode: "ask",
       planMode: true,
@@ -197,6 +198,11 @@ describe("schedule gateway snapshots", () => {
       }
     });
     expect(scriptSchedule.execution.model).toBeUndefined();
+    expect(scriptSchedule.execution.taskModelGroupId).toBeUndefined();
+    await gateway.saveSchedule(undefined, { ...scriptDraft, executionMode: "agent", sessionMode: "fresh", sessionId: "",
+      providerId: "", modelId: "", fastMode: false, inputText: "Resolve the group when this runs." });
+    expect(payloads[2]?.value.schedule.execution.taskModelGroupId).toBe("work");
+    expect(payloads[2]?.value.schedule.execution.model).toBeUndefined();
     await expect(gateway.saveSchedule(undefined, { ...scriptDraft, sessionMode: "persistent" })).rejects.toThrow(/fresh or bound/);
     gateway.disconnect();
   });
