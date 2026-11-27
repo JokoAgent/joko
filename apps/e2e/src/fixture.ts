@@ -868,7 +868,9 @@ export async function selectSystemTheme(page: Page): Promise<void> {
     location.hash = "#/settings/general";
     return previous;
   });
-  await page.getByRole("radiogroup", { name: "Theme", exact: true }).getByRole("radio", { name: "System", exact: true }).click();
+  const picker = page.getByRole("radiogroup", { name: "Theme", exact: true });
+  await picker.getByRole("radio", { name: "System", exact: true }).click();
+  await picker.getByRole("radio", { name: "System", exact: true, checked: true, disabled: false }).waitFor();
   await page.waitForFunction(() => document.documentElement.dataset.theme === "system");
   await page.evaluate(route => { location.hash = route; }, previousRoute);
 }
