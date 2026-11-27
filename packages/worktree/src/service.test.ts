@@ -792,6 +792,7 @@ describe("EphemeralWorktreeService", () => {
 
   test("recovers exact tracked, index, and untracked state from the post-reset crash boundary", { timeout: 30_000 }, async () => {
     const fixture = await createRepositoryFixture();
+    await writeFile(join(fixture.repositoryRoot, ".git", "info", "attributes"), "*.txt text eol=crlf\n");
     const first = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
     unwrap(await first.initialize());
     const acquired = unwrap(await first.acquire({ sessionId: "cleanup-exit-owner", cwd: fixture.repositoryRoot }));
@@ -822,21 +823,28 @@ describe("EphemeralWorktreeService", () => {
 
     const restarted = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
     unwrap(await restarted.initialize({ retainSessionIds: ["cleanup-exit-owner"] }));
-    expect((await readFile(join(acquired.lease.path, "tracked.txt"), "utf8")).replaceAll("\r\n", "\n"))
-      .toBe("unstaged at exit\n");
+    expect(await readFile(join(acquired.lease.path, "tracked.txt"))).toEqual(Buffer.from("unstaged at exit\r\n"));
     expect((await readFile(join(acquired.lease.path, "src", "index.ts"), "utf8")).replaceAll("\r\n", "\n"))
       .toBe("export const value = 2;\n");
-    expect((await readFile(join(acquired.lease.path, "exit-new.txt"), "utf8")).replaceAll("\r\n", "\n"))
-      .toBe("untracked at exit\n");
+    expect(await readFile(join(acquired.lease.path, "exit-new.txt"))).toEqual(Buffer.from("untracked at exit\r\n"));
     expect(await git(acquired.lease.path, ["diff", "--name-only"])).toBe("tracked.txt\n");
     expect(await git(acquired.lease.path, ["diff", "--cached", "--name-only"])).toBe("src/index.ts\n");
     expect(await git(fixture.repositoryRoot, ["stash", "list", "--format=%H%x09%gs"])).toBe(stashAfterExit);
   });
 
-  test.each(["tracked", "staged", "new", "rewritten"] as const)(
-    "preserves a %s edit made while checkout cleanup was interrupted",
-    { timeout: 30_000 }, async (edit) => {
+  test.each([
+    { edit: "tracked", file: "tracked.txt", bytes: "written while stopped\n" },
+    { edit: "staged", file: "tracked.txt", bytes: "archived tracked edit\n", staged: "staged while stopped\n" },
+    { edit: "new", file: "new.txt", bytes: "written while stopped\n" },
+    { edit: "rewritten", file: "notes.txt", bytes: "written while stopped\n" },
+    { edit: "reset tracked line-ending", file: "tracked.txt", bytes: "initial\r\n" },
+    { edit: "captured tracked line-ending", file: "tracked.txt", bytes: "archived tracked edit\r\n" },
+    { edit: "untracked line-ending", file: "notes.txt", bytes: "archived notes\r\n" }
+  ])(
+    "preserves a $edit edit made while checkout cleanup was interrupted",
+    { timeout: 30_000 }, async ({ file, bytes, staged }) => {
       const fixture = await createRepositoryFixture();
+      await writeFile(join(fixture.repositoryRoot, ".git", "info", "attributes"), "*.txt text eol=lf\n");
       const sessionId = "interrupted-cleanup";
       const first = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
       unwrap(await first.initialize());
@@ -851,14 +859,16 @@ describe("EphemeralWorktreeService", () => {
       first.dispose();
 
       await git(lease.path, ["reset", "--hard", "HEAD"]);
-      const file = edit === "new" ? "new.txt" : edit === "rewritten" ? "notes.txt" : "tracked.txt";
-      await writeFile(join(lease.path, file), "written while stopped\n");
-      if (edit === "staged") await git(lease.path, ["add", file]);
+      if (staged !== undefined) {
+        await writeFile(join(lease.path, file), staged);
+        await git(lease.path, ["add", file]);
+      }
+      await writeFile(join(lease.path, file), bytes);
       const restarted = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
       try {
         const sweep = unwrap(await restarted.initialize({ retainSessionIds: [sessionId] }));
-        expect(await readFile(join(lease.path, file), "utf8")).toBe("written while stopped\n");
-        if (edit === "staged") expect(await git(lease.path, ["show", `:${file}`])).toBe("written while stopped\n");
+        expect(await readFile(join(lease.path, file))).toEqual(Buffer.from(bytes));
+        if (staged !== undefined) expect(await git(lease.path, ["show", `:${file}`])).toBe(staged);
         expect(sweep.records).toMatchObject([{ status: "preserved", reason: "SESSION_CONFLICT" }]);
         expect(await snapshotRefSha(fixture.repositoryRoot, sessionId)).toBe(sha);
       } finally { restarted.dispose(); }

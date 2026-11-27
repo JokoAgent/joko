@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readlink, realpath, rm, rmdir, symlink, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -155,8 +156,63 @@ export async function copyWorktreeIncludeFiles(source: string, destination: stri
   }
 }
 
+function checkoutBytesChanged(): WorktreeServiceError {
+  return new WorktreeServiceError("SESSION_CONFLICT", "File bytes changed after archive capture.");
+}
+
+async function checkoutFileDigest(path: string, control: WorktreeOperationControl): Promise<string> {
+  const info = await lstat(path, { bigint: true });
+  if (info.isSymbolicLink()) return `link:${(await readlink(path, { encoding: "buffer" })).toString("hex")}`;
+  if (!info.isFile()) throw checkoutBytesChanged();
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || opened.dev !== info.dev || opened.ino !== info.ino) throw checkoutBytesChanged();
+    const hash = createHash("sha256");
+    for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      control.check();
+      hash.update(chunk);
+    }
+    return hash.digest("hex");
+  } finally { await handle.close(); }
+}
+
+// A clean filter can map different bytes to one blob. Compare with the bytes
+// Git actually checks out, including line endings and symlink representation.
+async function assertIndexCheckoutBytes(root: string, indexFile: string, paths: readonly string[], control: WorktreeOperationControl): Promise<void> {
+  const expected = join(dirname(indexFile), "checkout");
+  await mkdir(expected);
+  const prefix = expected.split(sep).join("/") + "/";
+  for (let offset = 0; offset < paths.length; offset += 100) {
+    const batch = paths.slice(offset, offset + 100);
+    if (!batch.every(safeRelativePath)) throw checkoutBytesChanged();
+    await runGit(["checkout-index", `--prefix=${prefix}`, "-z", "--stdin"], root, control,
+      { indexFile, input: batch.join("\0") + "\0" });
+    for (const key of batch) {
+      control.check();
+      const path = join(root, key), reference = join(expected, key);
+      await ordinaryParents(root, path, false);
+      const [actual, archived] = await Promise.all([checkoutFileDigest(path, control), checkoutFileDigest(reference, control)]);
+      if (actual !== archived) throw checkoutBytesChanged();
+      await unlink(reference);
+    }
+  }
+}
+
+export async function assertTrackedCheckoutBytes(root: string, tree: string, control: WorktreeOperationControl): Promise<void> {
+  const temp = await mkdtemp(join(tmpdir(), "joko-worktree-tracked-"));
+  try {
+    const indexFile = join(temp, "index");
+    await runGit(["read-tree", tree], root, control, { indexFile });
+    const listing = await runGit(["ls-files", "--stage", "-z"], root, control, { indexFile });
+    const paths = listing.stdout.split("\0").filter(entry => entry.startsWith("100") || entry.startsWith("120000 "))
+      .map(entry => entry.slice(entry.indexOf("\t") + 1));
+    await assertIndexCheckoutBytes(root, indexFile, paths, control);
+  } finally { await rm(temp, { recursive: true, force: true, maxRetries: 3 }); }
+}
+
 /** A restart can leave any subset of the archived untracked files on disk. */
-export async function cleanCapturedUntrackedFiles(root: string, snapshot: string, control: WorktreeOperationControl): Promise<void> {
+export async function cleanCapturedUntrackedFiles(root: string, snapshot: string, control: WorktreeOperationControl, resuming: boolean): Promise<void> {
   const paths = (await runGit(["ls-files", "--others", "-z"], root, control)).stdout.split("\0").filter(Boolean);
   const changed = () => new WorktreeServiceError("SESSION_CONFLICT", "Untracked work changed after archive capture.");
   const parents = (await runGit(["rev-list", "-n", "1", "--parents", snapshot], root, control)).stdout.trim().split(/\s+/u);
@@ -186,6 +242,7 @@ export async function cleanCapturedUntrackedFiles(root: string, snapshot: string
       await runGit(["--literal-pathspecs", "add", "-f", "--", ...paths.slice(offset, offset + 100)], root, control, { indexFile });
     }
     if ((await runGit(["write-tree"], root, control, { indexFile })).stdout.trim() !== captured) throw changed();
+    if (resuming) await assertIndexCheckoutBytes(root, indexFile, paths, control);
   } finally { await rm(temp, { recursive: true, force: true, maxRetries: 3 }); }
 
   for (const [path, original] of files) {
