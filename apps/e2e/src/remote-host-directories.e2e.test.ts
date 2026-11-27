@@ -12,6 +12,7 @@ import { expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { submit } from "./operations.js";
+import { conditionTimeoutMs } from "./test-deadlines.js";
 
 it.each(["/srv/new-project", "/home/fixture/server/new-project"])("browses and creates a revision-fenced SSH project at %s", async requestedPath => {
   let createdRemoteDirectory = false;
@@ -232,7 +233,14 @@ it.skipIf(!browserPath || !webDirectory)("downloads the original named SSH direc
     await page.getByLabel("Device name").fill("Directory download Browser");
     await page.locator("form.pair-form button[type=submit]").click();
     const link = page.getByRole("link", { name: "Remote docs", exact: true });
-    await link.click({ button: "right" });
+    expect(await link.getAttribute("href")).toBe(`#/files/${sessionId}?file=docs`);
+    const menu = page.getByRole("menu", { name: "File actions", exact: true });
+    const downloadFolder = menu.getByRole("menuitem", { name: "Download folder", exact: true });
+    // Loading the paired workspace replaces the timeline owner and dismisses its old menu.
+    await expect.poll(async () => {
+      if (!await menu.isVisible()) await link.click({ button: "right" });
+      return downloadFolder.isVisible();
+    }, { timeout: conditionTimeoutMs }).toBe(true);
     const checkDownload = async (surface: string): Promise<void> => {
       const preparePath = "/joko.v1.WorkspaceService/PrepareWorkspaceDirectoryDownload";
       let preparation = "no archive request";
