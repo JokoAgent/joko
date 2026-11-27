@@ -1,3 +1,5 @@
+import { createServer } from "node:http";
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 
 import { LocalRuntimeError } from "./errors.js";
@@ -49,6 +51,50 @@ describe("OllamaLoopbackClient", () => {
     ]);
     const oversized = new OllamaLoopbackClient(async () => new Response("{}", { headers: { "content-length": String(9 * 1024 * 1024) } }));
     await expect(oversized.tags()).rejects.toBeInstanceOf(LocalRuntimeError);
+  });
+
+  it.each(["deadline", "cancel"] as const)("releases a partially read HTTP response on %s", async (cause) => {
+    let receivedHeaders!: () => void;
+    const headers = new Promise<void>(resolve => { receivedHeaders = resolve; });
+    let recordDisconnect!: (interrupted: boolean) => void;
+    const disconnected = new Promise<boolean>(resolve => { recordDisconnect = resolve; });
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.write('{"version":');
+      const timer = setTimeout(() => response.end('"0.14.2"}'), 2_500);
+      response.on("close", () => {
+        clearTimeout(timer);
+        recordDisconnect(!response.writableEnded);
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("The test runtime did not bind a TCP port.");
+      const client = new OllamaLoopbackClient(async (url, init) => {
+        const response = await fetch(`http://127.0.0.1:${address.port}${new URL(url).pathname}`, init);
+        receivedHeaders();
+        return response;
+      });
+      const controller = new AbortController();
+      const version = client.version(controller.signal);
+      const rejected = expect(version).rejects.toMatchObject({ code: cause === "deadline" ? "RUNTIME_UNREACHABLE" : "OPERATION_CANCELLED" });
+      await headers;
+      await setImmediate();
+      if (cause === "cancel") controller.abort();
+      await rejected;
+      expect(await disconnected).toBe(true);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  it("skips a short runtime request already cancelled by its caller", async () => {
+    const fetchImpl = vi.fn<RuntimeFetch>(async () => new Response(null, { status: 200 }));
+    const client = new OllamaLoopbackClient(fetchImpl);
+    await expect(client.delete("model-a", AbortSignal.abort())).rejects.toMatchObject({ code: "OPERATION_CANCELLED" });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("parses bounded NDJSON and delegates one validated pull", async () => {

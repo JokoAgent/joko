@@ -25,3 +25,5 @@ jobs:
       - name: Run project identity, refresh and voice handshake assertions
         run: |
           node_modules/.bin/vitest run --reporter=verbose packages/code-host/src/project-provider.test.ts apps/orchestrator/src/partner-workbench-brief.test.ts apps/orchestrator/src/voice-input-coordinator.test.ts
+      - name: Exercise loopback runtime response lifetimes
+        run: node_modules/.bin/vitest run --reporter=verbose packages/local-model-runtime/src/ollama-client.test.ts
