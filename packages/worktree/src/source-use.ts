@@ -62,6 +62,18 @@ function processAbsent(pid: number): boolean {
 async function exists(file: string): Promise<boolean> {
   try { await lstat(file); return true; } catch (error) { if (missing(error)) return false; throw error; }
 }
+function windowsLockBusy(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return process.platform === "win32" && (code === "EPERM" || code === "EBUSY");
+}
+async function lockDirectoryPresent(directory: string): Promise<boolean> {
+  try { return await exists(directory); }
+  catch (error) {
+    // Windows can still hold a directory pending deletion. Wait for the next probe.
+    if (windowsLockBusy(error)) return true;
+    throw error;
+  }
+}
 async function pause(signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted();
   await new Promise<void>(resolveWait => setTimeout(resolveWait, 40));
@@ -71,8 +83,7 @@ async function removeEmptyLockDirectory(directory: string): Promise<void> {
   try { await rmdir(directory); }
   catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (missing(error) || code === "ENOTEMPTY" || code === "EEXIST") return;
-    if (process.platform === "win32" && (code === "EPERM" || code === "EBUSY")) return;
+    if (missing(error) || code === "ENOTEMPTY" || code === "EEXIST" || windowsLockBusy(error)) return;
     throw error;
   }
 }
@@ -86,7 +97,7 @@ async function releaseLock(directory: string, nonce: string): Promise<void> {
 
 /** Publish the claim and its owner together, including for readers using the old directory protocol. */
 async function publishLock(directory: string, nonce: string): Promise<boolean> {
-  if (await exists(directory)) return false;
+  if (await lockDirectoryPresent(directory)) return false;
   const pending = `${directory}.pending-${nonce}`;
   await mkdir(pending, { mode: 0o700 });
   let published = false;
@@ -97,8 +108,7 @@ async function publishLock(directory: string, nonce: string): Promise<boolean> {
     try { await rename(pending, directory); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EEXIST" || code === "ENOTEMPTY" || await exists(directory)) return false;
-      if (process.platform === "win32" && (code === "EPERM" || code === "EBUSY")) return false;
+      if (code === "EEXIST" || code === "ENOTEMPTY" || windowsLockBusy(error) || await lockDirectoryPresent(directory)) return false;
       throw error;
     }
     published = true;
@@ -119,7 +129,7 @@ async function clearEmptyLegacyLock(directory: string): Promise<void> {
     // An active or newly published claim contains owner.json. rmdir can only remove an empty directory.
     await removeEmptyLockDirectory(directory);
   } catch (error) {
-    if (!missing(error)) throw error;
+    if (!missing(error) && !windowsLockBusy(error)) throw error;
   }
 }
 
@@ -136,10 +146,10 @@ export async function withWorktreeSourceLock<T>(value: string, task: () => Promi
   while (nonce === undefined) {
     signal?.throwIfAborted();
     if (Date.now() > deadline) throw busy();
-    if (await exists(gate)) { await pause(signal); continue; }
+    if (await lockDirectoryPresent(gate)) { await pause(signal); continue; }
     const candidate = randomUUID();
     if (await publishLock(directory, candidate)) {
-      if (await exists(gate)) { await releaseLock(directory, candidate); await pause(signal); continue; }
+      if (await lockDirectoryPresent(gate)) { await releaseLock(directory, candidate); await pause(signal); continue; }
       nonce = candidate;
     } else {
       let owner: unknown;
