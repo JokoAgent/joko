@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -13,7 +13,8 @@ const git = async (cwd: string, ...args: string[]) => (await execute("git", args
   env: { ...process.env, LC_ALL: "C", GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never" } })).stdout.trim();
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true, maxRetries: 3 }); });
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "joko-branch-sync-")); roots.push(root);
+  const root = await realpath(await mkdtemp(join(tmpdir(), "joko-branch-sync-")));
+  roots.push(root);
   const remote = join(root, "remote.git"), seed = join(root, "seed"), local = join(root, "local"), checkout = join(root, "linked");
   await git(root, "init", "--bare", remote); await git(root, "clone", remote, seed);
   await git(seed, "config", "user.email", "branch@example.test"); await git(seed, "config", "user.name", "Branch test");
