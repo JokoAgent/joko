@@ -6,8 +6,12 @@ permissions:
   contents: read
 jobs:
   evidence:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -18,7 +22,7 @@ jobs:
         run: |
           git rev-parse HEAD 'HEAD^{tree}'
           npm install --prefix "$RUNNER_TEMP/audit-tools" --no-audit --no-fund vitest@4.1.9 typescript@5.9.3 minimatch@10.2.6
-          ln -s "$RUNNER_TEMP/audit-tools/node_modules" node_modules
+          node -e "require('node:fs').symlinkSync(require('node:path').join(process.env.RUNNER_TEMP,'audit-tools','node_modules'),'node_modules',process.platform==='win32'?'junction':'dir')"
       - name: Observe Git's filename decisions
         shell: bash
         run: |
@@ -30,3 +34,6 @@ jobs:
         shell: bash
         run: |
           node node_modules/vitest/vitest.mjs run --reporter=verbose packages/worktree/src/service.test.ts packages/tool-lsp/src/safety.test.ts -t 'while checkout cleanup was interrupted|post-reset crash boundary|Git wildcard components'
+      - name: Exercise the complete worktree and LSP package suites
+        shell: bash
+        run: node node_modules/vitest/vitest.mjs run --reporter=verbose packages/worktree/src packages/tool-lsp/src
