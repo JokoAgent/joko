@@ -3,7 +3,7 @@ import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import type { CodeHostProvider } from "@joko/code-host";
+import { createGitLabCodeHostProvider, type CodeHostProvider, type CodeHostSessionAuthorizationPort } from "@joko/code-host";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -11,7 +11,9 @@ import {
   OperationalCodeHostSessionAuthorization,
   readSessionCodeHostProjection,
   SESSION_CODE_HOST_PROJECTION_SETTING_KEY,
-  SessionCodeHostContextRuntime
+  SessionCodeHostContextRuntime,
+  validateNewPullRequestAssociations,
+  writeSessionPullRequestAssociations
 } from "./session-code-host-context.js";
 import { nativeBindingFingerprint } from "./native-state-observation.js";
 import { toProtoSession } from "./proto-mapper.js";
@@ -24,6 +26,29 @@ afterEach(() => {
 });
 
 describe("Session code-host context", () => {
+  it("validates a manual GitLab association and refreshes it under the stored session authorization", async () => {
+    const { store } = createFixture("Ordinary task");
+    const session = store.getSession("session-1");
+    const url = "https://gitlab.com/team/project/-/merge_requests/7";
+    const associations = { format: 1 as const, orderedUrls: [url], removedUrls: [] };
+    let state = "opened";
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ data: { project: { mergeRequest: {
+      state, draft: false, title: "Review this change", sourceBranch: "feature", conflicts: false
+    } } } }));
+    const providers = (authorization: CodeHostSessionAuthorizationPort) => [createGitLabCodeHostProvider({
+      authorization, readToken: async host => host === "gitlab.com" ? "test-token" : undefined, fetch: fetcher
+    })];
+    await validateNewPullRequestAssociations(session.descriptor.id, associations, [], providers, () => {}, new AbortController().signal);
+    writeSessionPullRequestAssociations(store, session, associations);
+    state = "merged";
+    const runtime = new SessionCodeHostContextRuntime({ store, providers: providers(new OperationalCodeHostSessionAuthorization(store)) });
+    await runtime.refreshSession(session.descriptor.id);
+    expect(readSessionCodeHostProjection(store, session.descriptor.id)?.references).toMatchObject([{
+      reference: { webUrl: url }, projection: { state: "merged", hasConflicts: false }
+    }]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("reads each committed history batch once and publishes the final references", async () => {
     const { store } = createFixture("Ordinary task");
     const sessionId = "session-1";

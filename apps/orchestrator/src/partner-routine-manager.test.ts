@@ -139,16 +139,25 @@ describe("Partner routine authority and independent execution", () => {
     expect(f.profiles.getSessionLink('routine-unknown-native')).toMatchObject({ role: 'routine', routineKey: input.key, partnerId: f.partner.id });
   });
 
-  it("keeps group fallback on the routine's original profile version", async () => {
+  it("uses the model group on the version adopted by the same routine task", async () => {
     const f = await fixture(), exact = f.partner.capabilities.modelChain[0]!;
     const grouped = await f.partners.updatePartner(f.partner.id, f.partner.revision, {
       capabilities: { ...f.partner.capabilities, modelChain: [{ ...exact, taskModelGroupId: "writers" }] } });
     const { id: sessionId } = await f.partners.ensureRoutineSession({ partnerId: grouped.id, key: "routine:group",
       title: "Group", assertCurrent: () => undefined });
-    await f.partners.updatePartner(grouped.id, grouped.revision, { capabilities: f.partner.capabilities });
     const first = { ...exact, backendId: "another-local" };
-    expect(f.partners.routineFallback({ sessionId, current: exact, currentHop: 0, visitedRoutes: [] },
-      id => id === "writers" ? [first, exact] : undefined)).toEqual({ owned: true, candidate: first });
+    const members = vi.fn((id: string) => id === "writers" ? [first, exact] : undefined);
+    const input = { sessionId, current: exact, currentHop: 0, visitedRoutes: [] };
+    expect(f.profiles.getSessionLink(sessionId)?.profileVersion).toBe(grouped.profileVersion);
+    expect(f.partners.routineFallback(input, members)).toEqual({ owned: true, candidate: first });
+    expect(members).toHaveBeenCalledWith("writers");
+
+    const updated = await f.partners.updatePartner(grouped.id, grouped.revision, { capabilities: f.partner.capabilities });
+    expect(updated.profileVersion).toBeGreaterThan(grouped.profileVersion);
+    expect(f.profiles.getSessionLink(sessionId)).toMatchObject({ role: "routine", partnerId: grouped.id, profileVersion: updated.profileVersion });
+    members.mockClear();
+    expect(f.partners.routineFallback(input, members)).toEqual({ owned: true });
+    expect(members).not.toHaveBeenCalled();
   });
 
   it('keeps archived routine history and starts the next trigger only after the original native close is confirmed', async () => {

@@ -2,7 +2,7 @@ import type { JSONContent } from "@tiptap/core";
 import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar.js";
 import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine, BackgroundTaskOutput } from "@joko/contracts";
 import type { PartnerLearningFeedbackView, PersonalDevelopmentDoctorRun, PersonalDevelopmentTask, ProviderModelWithdrawalReview } from "@joko/contracts";
-import type { SchedulePullRequestRule } from "@joko/contracts";
+import type { InputContent, SchedulePullRequestRule } from "@joko/contracts";
 import type { PersonalDevelopmentApi } from "./personal-development-api.js";
 import type { HostedAgentSettingsApi } from "./hosted-agent-settings.js";
 
@@ -2813,6 +2813,7 @@ export interface WorkspaceRewindPreviewView {
 export interface ScheduleView {
   readonly taskModelGroupId?: string;
   readonly id: string;
+  readonly revision?: bigint;
   readonly name: string;
   readonly source: "user" | "project";
   readonly projectConfigId?: string;
@@ -2826,6 +2827,7 @@ export interface ScheduleView {
   readonly expression: string;
   readonly timezone: string;
   readonly inputText: string;
+  readonly input?: InputContent;
   readonly executionMode: "agent" | "script";
   readonly script?: {
     readonly command: string;
@@ -2996,6 +2998,7 @@ export interface SchedulerRuntimeView {
 }
 
 export interface ScheduleDraft {
+  readonly original?: Pick<ScheduleView, "id" | "revision" | "input" | "inputText">;
   readonly taskModelGroupId?: string;
   readonly name: string;
   readonly backendId: string;

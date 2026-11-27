@@ -5531,6 +5531,27 @@ describe("native mobile Automation ownership and recovery", () => {
     ]);
   });
 
+  it("rejects an open Automation draft after another editor pauses it and the catalog refreshes", async () => {
+    const fixture = authoringAutomationNetwork();
+    const first = client(fixture.network, memoryStorage(credential).storage);
+    const second = client(fixture.network, memoryStorage(credential).storage);
+    await first.start();
+    await second.start();
+    await first.openAutomations();
+    await second.openAutomations();
+    const original = first.state.automations.schedules[0]!;
+    const draft = createMobileAutomationDraft(first.state.owner, original);
+    const other = createMobileAutomationDraft(second.state.owner, second.state.automations.schedules[0]);
+    const paused = await second.saveAutomation({ ...other, enabled: false, inputText: "New instructions" }, original.scheduleId);
+    expect(paused?.revision.value).toBeGreaterThan(original.revision.value);
+    await first.refreshAutomations();
+    expect(first.state.automations.schedules[0]).toMatchObject({ revision: paused!.revision, state: "disabled" });
+    await expect(first.saveAutomation({ ...draft, name: "Stale rename" }, original.scheduleId)).rejects.toThrow(/changed/);
+    expect(fixture.network.submit).toHaveBeenCalledTimes(1);
+    expect(fixture.catalog()[0]).toMatchObject({ displayName: original.displayName, state: ScheduleState.DISABLED,
+      input: { parts: [{ content: { case: "text", value: "New instructions" } }] } });
+  });
+
   it("keeps an ineligible Worktree probe authoritative without requesting an invalid source catalog", async () => {
     const fixture = authoringAutomationNetwork();
     const app = client(fixture.network, memoryStorage(credential).storage);

@@ -5657,7 +5657,7 @@ function fromProtoScheduleExecution(value: ScheduleExecutionSnapshot | undefined
     ? undefined : contract.schedulePullRequestRuleFromProto(value.followPullRequest);
   if (value.followPullRequest !== undefined && followPullRequest === undefined &&
     (value.followPullRequest.url !== "" || value.followPullRequest.change !== contract.SchedulePullRequestChange.UNSPECIFIED)) {
-    throw new ProtoMappingError("invalid_argument", "schedule.execution.follow_pull_request", "Select a valid GitHub pull request and condition.");
+    throw new ProtoMappingError("invalid_argument", "schedule.execution.follow_pull_request", "Select a valid GitHub pull request or GitLab merge request and condition.");
   }
   const extension: ScheduleExtensionSnapshot = {
     format: 1,

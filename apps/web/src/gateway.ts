@@ -4528,7 +4528,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (scriptMode && draft.sessionMode === "persistent") throw new GatewayError("Script schedules require fresh or bound task mode.");
     if (draft.sessionMode === "bound" && !draft.sessionId) throw new GatewayError("Choose a task for the bound schedule.");
     const followPullRequest = draft.followPullRequest == null ? draft.followPullRequest : normalizeSchedulePullRequestRule(draft.followPullRequest);
-    if (draft.followPullRequest != null && followPullRequest === undefined) throw new GatewayError("Select a valid GitHub pull request and condition.");
+    if (draft.followPullRequest != null && followPullRequest === undefined) throw new GatewayError("Select a valid GitHub pull request or GitLab merge request and condition.");
     if (draft.scriptTimeoutMs !== undefined && (!Number.isSafeInteger(draft.scriptTimeoutMs) || draft.scriptTimeoutMs <= 0)) {
       throw new GatewayError("Script timeout must be a positive whole number of milliseconds.");
     }
@@ -4550,7 +4550,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           : ScheduleSessionMode.BOUND,
       recurrence: scheduleRecurrence(draft),
       timeZone: draft.timezone,
-      input: { parts: draft.inputText.trim().length === 0 ? [] : [{ content: { case: "text", value: draft.inputText } }] },
+      input: draft.original?.input && draft.inputText === draft.original.inputText
+        ? draft.original.input
+        : { parts: draft.inputText.trim().length === 0 ? [] : [{ content: { case: "text", value: draft.inputText } }] },
       execution: {
         ...(!scriptMode && draft.providerId.length > 0 && draft.modelId.length > 0 ? { model: { model: { providerId: draft.providerId, modelId: draft.modelId }, effortId: draft.effort ?? "", ...encodeModelSpeed(draft.fastMode) } } : {}),
         taskModelGroupId: scriptMode ? undefined : draft.taskModelGroupId,
@@ -4586,9 +4588,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       misfirePolicy: draft.misfirePolicy === "skip" ? ScheduleMisfirePolicy.SKIP : ScheduleMisfirePolicy.RUN_ONCE,
       enabled: draft.enabled
     });
-    await this.submit(scheduleId === undefined
-      ? { case: "createSchedule", value: { schedule } }
-      : { case: "updateSchedule", value: { scheduleId, schedule } }, true);
+    if (scheduleId === undefined) {
+      await this.submit({ case: "createSchedule", value: { schedule } }, true);
+      return;
+    }
+    if (draft.original?.id !== scheduleId || draft.original.revision === undefined) {
+      throw new GatewayError("Reopen the schedule to edit its current revision.");
+    }
+    await this.submit({ case: "updateSchedule", value: { scheduleId, schedule } }, true, [{
+      entity: { kind: EntityKind.SCHEDULE, id: scheduleId }, expectedRevision: { value: draft.original.revision }
+    }]);
   }
 
   async listScheduleRunHistory(scheduleId: string, pageToken = "", pageSize = 20): Promise<ScheduleHistoryPageView> {
@@ -17309,6 +17318,7 @@ function mapSchedule(schedule: Schedule): ScheduleView {
   return {
     id: schedule.scheduleId,
     name: schedule.displayName,
+    revision: schedule.version?.revision?.value,
     source: schedule.source === ScheduleSource.PROJECT ? "project" : "user",
     ...(schedule.projectConfigId.length === 0 ? {} : { projectConfigId: schedule.projectConfigId }),
     ...(schedule.projectConfigPath.length === 0 ? {} : { projectConfigPath: schedule.projectConfigPath }),
@@ -17327,6 +17337,7 @@ function mapSchedule(schedule: Schedule): ScheduleView {
     expression,
     timezone: schedule.timeZone,
     inputText: inputText(schedule.input),
+    input: schedule.input,
     executionMode: schedule.execution?.executionMode === ScheduleExecutionMode.SCRIPT ? "script" : "agent",
     ...(schedule.execution?.script === undefined ? {} : {
       script: {

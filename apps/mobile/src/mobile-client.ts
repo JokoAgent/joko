@@ -7094,6 +7094,9 @@ export class MobileClient {
         throw new Error("Reopen Automations from the current Joko node before saving.");
       }
       const existing = scheduleId === undefined ? undefined : await this.#revalidateAutomationSchedule(scheduleId);
+      if (existing && mobileAutomationScheduleRevisionKey(existing) !== draft.scheduleRevision) {
+        throw new Error("The Automation Schedule changed while it was being edited. Reopen it to review the changes.");
+      }
       if (this.#state.owner !== owner || this.#automationOwnerKey() !== authorityKey) {
         throw new Error("The Automation owner changed before the Schedule could be saved.");
       }

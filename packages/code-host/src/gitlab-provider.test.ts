@@ -4,12 +4,14 @@ import { createGitLabCodeHostProvider, parseCodeHostPullRequestReference } from 
 it.each(["gitlab.com", "git.room.example"] as const)("reads the exact authorized GitLab host %s and fences changes", async host => {
   const reference = parseCodeHostPullRequestReference(`https://${host}/group/sub/project/-/merge_requests/7`)!;
   let owner = true, state = "opened";
+  let approved: boolean | null = false, mergedAt: string | null = null;
   let currentToken: string | undefined = "first-test-token";
-  let hasNextPage = false, hasConflicts: boolean | undefined = true;
+  let hasNextPage = false, conflicts: boolean | undefined = true;
   const authorize = vi.fn(() => owner ? { sessionOwnerId: "test-task", referenceKey: reference.key, ownerRevision: "1" } : undefined);
   const readToken = vi.fn(async (requestedHost: string) => requestedHost === host ? currentToken : undefined);
   const response = () => Response.json({ data: { project: { mergeRequest: {
-    state, hasConflicts, title: "Exact merge request", draft: false, sourceBranch: "feature/ordered", resolvableDiscussionsCount: 4, resolvedDiscussionsCount: 3,
+    state, conflicts, title: "Exact merge request", draft: false, sourceBranch: "feature/ordered", resolvableDiscussionsCount: 4, resolvedDiscussionsCount: 3,
+    approved, userNotesCount: 3, mergedAt,
     diffHeadSha: "a".repeat(40), headPipeline: { jobs: { count: 4, pageInfo: { hasNextPage },
       nodes: [{ status: "SUCCESS" }, { status: "FAILED" }, { status: "MANUAL", allowFailure: true }, { status: "RUNNING" }] } }
   } } } });
@@ -21,22 +23,43 @@ it.each(["gitlab.com", "git.room.example"] as const)("reads the exact authorized
     checks: { total: 4, passed: 1, failed: 1, skipped: 1, pending: 1 } });
   expect(fetcher).toHaveBeenCalledWith(`https://${host}/api/graphql`, expect.objectContaining({ redirect: "error", credentials: "omit" }));
   expect(readToken.mock.calls).toEqual([[host, expect.any(AbortSignal)], [host, expect.any(AbortSignal)]]);
-  expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body)).variables).toEqual({ path: "group/sub/project", iid: "7" });
+  const { query, variables } = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body));
+  expect(query).toMatch(/\bconflicts\b/);
+  expect(query).not.toMatch(/\bhasConflicts\b/);
+  expect(variables).toEqual({ path: "group/sub/project", iid: "7" });
+  const follow = { ...input, purpose: "follow" as const };
+  const open = await provider.getPullRequest(reference, follow);
+  expect(open.activity).toMatchObject({
+    headSha: "a".repeat(40), reviewDecision: "not_approved", commentCount: 3, mergeState: "conflicts",
+    checks: expect.arrayContaining(["failed:1", "pending:1"])
+  });
+  expect(open.activity).not.toHaveProperty("mergedAt");
+  const followRequest = JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body));
+  expect(followRequest.variables).toEqual(variables);
+  expect(followRequest.query.match(/\w+/gu)).toEqual(expect.arrayContaining(["approved", "userNotesCount", "mergedAt"]));
   state = "merged";
+  approved = true;
+  mergedAt = "2026-11-27T01:00:00Z";
   hasNextPage = true;
-  hasConflicts = false;
-  const merged = await provider.getPullRequest(reference, input);
+  conflicts = false;
+  const merged = await provider.getPullRequest(reference, follow);
   expect(merged.state).toBe("merged");
+  expect(merged.activity).toMatchObject({ mergedAt: Date.parse(mergedAt), reviewDecision: "approved", mergeState: "no_conflicts" });
   expect(merged.checks).toBeUndefined();
   expect(merged.hasConflicts).toBe(false);
-  hasConflicts = undefined;
-  await expect(provider.getPullRequest(reference, input)).resolves.not.toHaveProperty("hasConflicts");
+  conflicts = undefined;
+  approved = null;
+  mergedAt = null;
+  const unknown = await provider.getPullRequest(reference, follow);
+  expect(unknown).not.toHaveProperty("hasConflicts");
+  expect(unknown.activity).not.toHaveProperty("mergedAt");
+  expect(unknown.activity).not.toHaveProperty("reviewDecision");
   fetcher.mockImplementationOnce(async () => { currentToken = "rotated-test-token"; return response(); });
-  await expect(provider.getPullRequest(reference, input)).rejects.toMatchObject({ name: "CodeHostProviderUnavailableError" });
+  await expect(provider.getPullRequest(reference, follow)).rejects.toMatchObject({ name: "CodeHostProviderUnavailableError" });
   owner = false;
   await expect(provider.getPullRequest(reference, input)).rejects.toMatchObject({ name: "CodeHostProviderUnavailableError" });
   owner = true;
   currentToken = undefined;
   await expect(provider.getPullRequest(reference, input)).rejects.toMatchObject({ name: "CodeHostProviderUnavailableError" });
-  expect(fetcher).toHaveBeenCalledTimes(4);
+  expect(fetcher).toHaveBeenCalledTimes(5);
 });

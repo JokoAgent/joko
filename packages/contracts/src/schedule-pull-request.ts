@@ -20,8 +20,18 @@ const changes = {
 };
 
 export function schedulePullRequestUrl(input: unknown): string | undefined {
-  if (typeof input !== "string") return undefined;
-  const match = /^https:\/\/github\.com\/([a-z\d](?:[a-z\d-]{0,37}[a-z\d])?)\/([a-z\d][a-z\d._-]{0,99})\/pull\/([1-9]\d{0,9})\/?$/iu.exec(input.trim());
+  if (typeof input !== "string" || input.length > 2048) return undefined;
+  const raw = input.trim();
+  const mr = /^https:\/\/([a-z\d](?:[a-z\d.-]{0,253}[a-z\d])?)\/((?:[a-z\d][a-z\d._-]{0,99}\/)+[a-z\d][a-z\d._-]{0,99})\/-\/merge_requests\/([1-9]\d{0,9})\/?$/iu.exec(raw);
+  if (mr) {
+    const host = mr[1]!.toLowerCase(), path = mr[2]!, number = mr[3]!;
+    if (host === "github.com" || Number(number) > 2_147_483_647 || `${host}/${path}#${number}`.length > 512) return undefined;
+    try {
+      if (new URL(raw).hostname !== host) return undefined;
+    } catch { return undefined; }
+    return `https://${host}/${path}/-/merge_requests/${number}`;
+  }
+  const match = /^https:\/\/github\.com\/([a-z\d](?:[a-z\d-]{0,37}[a-z\d])?)\/([a-z\d][a-z\d._-]{0,99})\/pull\/([1-9]\d{0,9})\/?$/iu.exec(raw);
   if (match === null || Number(match[3]) > 2_147_483_647) return undefined;
   return `https://github.com/${match[1]!.toLowerCase()}/${match[2]!.toLowerCase()}/pull/${match[3]}`;
 }

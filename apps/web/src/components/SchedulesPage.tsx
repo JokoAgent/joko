@@ -1167,6 +1167,7 @@ export function scheduleDraft(schedule: ScheduleView | undefined, targets: reado
   const timezone = schedule?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   const onceTriggerAt = schedule?.kind === "once" ? Date.parse(schedule.expression) : undefined;
   return {
+    ...(schedule === undefined ? {} : { original: schedule }),
     name: schedule?.name ?? "",
     backendId,
     targetId: schedule?.targetId ?? target?.id ?? "",

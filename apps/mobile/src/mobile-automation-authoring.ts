@@ -75,6 +75,7 @@ export interface MobileAutomationWorktreeProof {
 }
 
 export interface MobileAutomationDraft {
+  readonly scheduleRevision?: string;
   readonly name: string;
   readonly targetId: string;
   readonly backendId: string;
@@ -336,6 +337,7 @@ export function createMobileAutomationDraft(
     : schedule.recurrence === "once" ? mobileScheduleLocalDateTimeFromEpoch(Date.parse(schedule.recurrenceExpression), timeZone)
       : schedule.recurrenceExpression;
   return {
+    ...(schedule === undefined ? {} : { scheduleRevision: mobileAutomationScheduleRevisionKey(schedule) }),
     name: schedule?.displayName ?? "",
     targetId: schedule?.targetId ?? target?.targetId ?? "",
     backendId,

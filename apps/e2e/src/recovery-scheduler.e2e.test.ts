@@ -4,7 +4,7 @@ import { create, clone } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import {
-  OperationMutationSchema, OperationState, QueueDispatchState, QueueItemState, RunState, ScheduleInputSchema,
+  EntityKind, InputContentSchema, OperationMutationSchema, OperationState, QueueDispatchState, QueueItemState, RunState, ScheduleInputSchema, ScheduleRecurrenceSchema,
   ScheduleRunOutcome, ScheduleSessionMode, ScheduleState, schedulePullRequestRuleToProto, type QueueControl
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
@@ -35,7 +35,69 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     fixture = undefined;
   });
 
-  it.each(["checks", "review"] as const)("wakes only the authorized bound task for newly readable PR %s and coalesces busy changes", { timeout: 45_000 }, async change => {
+  it("rejects a stale Web schedule rename after a catalog refresh and preserves the other device's pause and prompt", async () => {
+    const host = fixture = await OrchestratorE2eFixture.start();
+    const first = await host.pair("Schedule editor");
+    const second = await host.pair("Other schedule editor");
+    const request = createManualScheduleMutation({ backendId: host.adapter().id, targetId: host.targetId(), text: "Old instructions" });
+    if (request.payload.case !== "createSchedule" || !request.payload.value.schedule) throw new Error("Missing schedule input.");
+    const input = request.payload.value.schedule;
+    input.recurrence = create(ScheduleRecurrenceSchema, { kind: { case: "cron", value: { expression: "0 3 * * *" } } });
+    const scheduleId = scheduleIdFrom(await submit(first.clients.operation, first.connectionId, request));
+    const editor = await openWebScheduleEditor(host, first);
+    try {
+      const draft = editor.draft(scheduleId);
+      const { schedule: opened } = await second.clients.scheduler.getSchedule({ scheduleId });
+      expect(opened?.nextTriggerAt).toBeDefined();
+      const updated = clone(ScheduleInputSchema, input);
+      updated.enabled = false;
+      updated.input = create(InputContentSchema, { parts: [{ content: { case: "text", value: "New instructions" } }] });
+      const result = await submit(second.clients.operation, second.connectionId, create(OperationMutationSchema, {
+        preconditions: [{ entity: { kind: EntityKind.SCHEDULE, id: scheduleId }, expectedRevision: opened!.version!.revision }],
+        payload: { case: "updateSchedule", value: { scheduleId, schedule: updated } }
+      }));
+      expect(result.state).toBe(OperationState.SUCCEEDED);
+      const paused = host.application.store.getSchedule(scheduleId);
+      await editor.gateway.refresh();
+      expect(editor.draft(scheduleId)).toMatchObject({ enabled: false, inputText: "New instructions" });
+      await expect(editor.gateway.saveSchedule(scheduleId, { ...draft, name: "Stale rename" })).rejects.toThrow(/revision|conflict/i);
+      expect(host.application.store.getSchedule(scheduleId)).toEqual(paused);
+      const { schedule } = await first.clients.scheduler.getSchedule({ scheduleId });
+      expect(schedule).toMatchObject({ displayName: input.displayName, state: ScheduleState.DISABLED,
+        input: { parts: [{ content: { case: "text", value: "New instructions" } }] } });
+      expect(host.application.store.listDueSchedules(paused.nextRunAt!)).toEqual([]);
+    } finally { editor.gateway.disconnect(); }
+  });
+
+  it("round trips the complete v1 scheduled input through a Web rename", async () => {
+    const host = fixture = await OrchestratorE2eFixture.start();
+    const owner = await host.pair("Schedule editor");
+    const request = createManualScheduleMutation({ backendId: host.adapter().id, targetId: host.targetId(), text: "Summarize" });
+    if (request.payload.case !== "createSchedule" || !request.payload.value.schedule) throw new Error("Missing schedule input.");
+    const schedule = request.payload.value.schedule;
+    schedule.input = create(InputContentSchema, {
+      parts: [{ content: { case: "text", value: "Summarize" } }, { content: { case: "workspaceMention", value: {
+        workspaceId: "workspace-main", relativePath: "notes/today.md", displayText: "today.md", lineRange: { startLine: 2, endLine: 4 }
+      } } }]
+    });
+    const scheduleId = scheduleIdFrom(await submit(owner.clients.operation, owner.connectionId, request));
+    const editor = await openWebScheduleEditor(host, owner);
+    try {
+      const draft = editor.draft(scheduleId);
+      expect(draft.inputText).toBe("Summarize\n@today.md");
+      await editor.gateway.saveSchedule(scheduleId, { ...draft, name: "Renamed schedule" });
+      const saved = (await owner.clients.scheduler.getSchedule({ scheduleId })).schedule;
+      expect(saved?.displayName).toBe("Renamed schedule");
+      expect(saved?.input).toEqual(schedule.input);
+      expect(host.application.store.getSchedule(scheduleId).prompt.mentions).toMatchObject([{
+        kind: "workspace_file", workspaceId: "workspace-main", reference: "notes/today.md", label: "today.md",
+        lineRange: { startLine: 2, endLine: 4 }
+      }]);
+    } finally { editor.gateway.disconnect(); }
+  });
+
+  it.each([["checks", "github.com"], ["review", "github.com"], ["checks", "git.team.example"]] as const)(
+    "wakes only the authorized bound task for newly readable PR %s on %s and coalesces busy changes", { timeout: 45_000 }, async (change, host) => {
     let clock = Date.now() - 10 * 60_000;
     let signal: "failure" | "queued" | "success" | undefined;
     const reads: { owner: string; url: string; authorized: boolean }[] = [];
@@ -45,7 +107,7 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
       pullRequestProviders: authority => [{
         capability: "code-host.pull-request",
         minimumTimeToLiveMs: 5_000,
-        supports: reference => reference.host === "github.com",
+        supports: reference => reference.host === host,
         getPullRequest: async (reference, options) => {
           const authorized = authority.authorize(options.sessionOwnerId, reference);
           reads.push({ owner: options.sessionOwnerId, url: reference.webUrl,
@@ -66,8 +128,9 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
       createSessionMutation({ backendId, targetId, displayName: "Bound follow task" })));
     const unrelatedId = sessionIdFrom(await submit(clients.operation, connectionId,
       createSessionMutation({ backendId, targetId, displayName: "Unrelated task" })));
-    const rawUrl = "https://github.com/JokoAgent/Joko/pull/17/";
-    const url = "https://github.com/jokoagent/joko/pull/17";
+    const mr = "https://git.team.example/group/Sub/project/-/merge_requests/7";
+    const rawUrl = host === "github.com" ? "https://github.com/JokoAgent/Joko/pull/17/" : mr + "/";
+    const url = host === "github.com" ? "https://github.com/jokoagent/joko/pull/17" : mr;
     const request = createManualScheduleMutation({ backendId, targetId, sessionId,
       sessionMode: ScheduleSessionMode.BOUND, text: "Inspect the changed checks.", execution: {
         followPullRequest: schedulePullRequestRuleToProto({ url: rawUrl, change })
@@ -421,6 +484,23 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     }
   });
 });
+
+async function openWebScheduleEditor(host: OrchestratorE2eFixture, owner: Awaited<ReturnType<OrchestratorE2eFixture["pair"]>>) {
+  const { createOrchestratorGateway, mapSnapshot } = await import(new URL("../../web/src/gateway.ts", import.meta.url).href);
+  const { scheduleDraft } = await import(new URL("../../web/src/components/SchedulesPage.tsx", import.meta.url).href);
+  let snapshot: ReturnType<typeof mapSnapshot>;
+  const gateway = createOrchestratorGateway({ id: owner.connectionId, deviceId: owner.deviceId, serverId: "orchestrator-e2e",
+    name: "Schedule Web editor", origin: host.baseUrl }, owner.authKey, {
+    onSnapshot: (current: typeof snapshot) => { snapshot = current; }
+  }, () => createConnectTransport({ baseUrl: host.baseUrl, httpVersion: "1.1", useBinaryFormat: true,
+    interceptors: [next => async request => { request.header.set("authorization", `Bearer ${owner.authKey}`); return next(request); }] }));
+  await gateway.connect({ snapshotOnly: true });
+  return { gateway, draft(scheduleId: string) {
+    const schedule = snapshot.schedules.find((item: { id: string }) => item.id === scheduleId);
+    if (!schedule) throw new Error("Schedule missing from the editor's catalog.");
+    return scheduleDraft(schedule, snapshot.targets, snapshot.sessions, snapshot.models, snapshot.backends);
+  } };
+}
 
 function requiredQueueControl(response: { readonly queueControl?: QueueControl }): QueueControl {
   if (response.queueControl === undefined) throw new Error("Orchestrator returned no queue control.");

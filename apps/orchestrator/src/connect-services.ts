@@ -25549,7 +25549,7 @@ function scheduleExecutionSnapshot(
     : contract.schedulePullRequestRuleFromProto(follow);
   if (follow !== undefined && followPullRequest === undefined &&
     (follow.url !== "" || follow.change !== contract.SchedulePullRequestChange.UNSPECIFIED)) {
-    throw invalidArgument("Select a valid GitHub pull request and condition.");
+    throw invalidArgument("Select a valid GitHub pull request or GitLab merge request and condition.");
   }
   const extension: ScheduleExtensionSnapshot = {
     format: 1,

@@ -8,10 +8,11 @@ import { CODE_HOST_PULL_REQUEST_CAPABILITY, CodeHostProviderRetryableError, Code
   CodeHostPullRequestNotFoundError, type CodeHostProvider, type CodeHostProviderResult, type CodeHostPullRequestChecks, type CodeHostPullRequestReference } from "./types.js";
 import { boundedCodeHostChecks, boundedCodeHostHeadBranch, boundedCodeHostPullRequestTitle } from "./validation.js";
 
-const QUERY = `query MergeRequest($path: ID!, $iid: String!) {
+const query = (follow: boolean) => `query MergeRequest($path: ID!, $iid: String!) {
   project(fullPath: $path) {
     mergeRequest(iid: $iid) {
-      state draft title sourceBranch diffHeadSha resolvableDiscussionsCount resolvedDiscussionsCount hasConflicts
+      state draft title sourceBranch diffHeadSha resolvableDiscussionsCount resolvedDiscussionsCount conflicts
+      ${follow ? "mergedAt approved userNotesCount" : ""}
       headPipeline { jobs(retried: false, first: 100) { count nodes { status allowFailure } pageInfo { hasNextPage } } }
     }
   }
@@ -29,7 +30,8 @@ export function createGitLabCodeHostProvider(options: {
     minimumTimeToLiveMs: 60_000,
     supports: isGitLabReference,
     async getPullRequest(reference, input) {
-      if (input.purpose === "follow" || !isGitLabReference(reference)) throw new CodeHostProviderUnavailableError();
+      if (!isGitLabReference(reference)) throw new CodeHostProviderUnavailableError();
+      const follow = input.purpose === "follow";
       const authorization = options.authorization.authorize(input.sessionOwnerId, reference);
       if (authorization === undefined) throw new CodeHostProviderUnavailableError();
       const signal = AbortSignal.any([input.signal, AbortSignal.timeout(15_000)]);
@@ -44,7 +46,7 @@ export function createGitLabCodeHostProvider(options: {
       try {
         response = await request(`https://${reference.host}/api/graphql`, { method: "POST", redirect: "error", credentials: "omit", referrerPolicy: "no-referrer", signal,
           headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json" },
-          body: JSON.stringify({ query: QUERY, variables: { path: `${reference.repositoryOwner}/${reference.repositoryName}`, iid: String(reference.number) } }) });
+          body: JSON.stringify({ query: query(follow), variables: { path: `${reference.repositoryOwner}/${reference.repositoryName}`, iid: String(reference.number) } }) });
       } catch {
         assertCurrent();
         throw new CodeHostProviderRetryableError();
@@ -56,7 +58,7 @@ export function createGitLabCodeHostProvider(options: {
       const confirmed = await readToken(reference.host, signal);
       assertCurrent();
       if (confirmed !== token) throw new CodeHostProviderUnavailableError();
-      return parseMergeRequest(raw);
+      return parseMergeRequest(raw, follow);
     }
   };
 }
@@ -73,7 +75,7 @@ async function readGitLabResponse(response: Response): Promise<unknown> {
   return readBoundedJson(response, 256 * 1024);
 }
 
-function parseMergeRequest(value: unknown): CodeHostProviderResult {
+function parseMergeRequest(value: unknown, follow: boolean): CodeHostProviderResult {
   const envelope = record(value);
   if (Array.isArray(envelope?.["errors"]) && envelope["errors"].length > 0) throw new CodeHostProviderUnavailableError();
   const mr = record(record(record(envelope?.["data"])?.["project"])?.["mergeRequest"]);
@@ -87,8 +89,18 @@ function parseMergeRequest(value: unknown): CodeHostProviderResult {
   const unresolved = typeof total === "number" && typeof resolved === "number" && Number.isSafeInteger(total)
     && Number.isSafeInteger(resolved) && total >= resolved && resolved >= 0 && total - resolved <= 100 ? total - resolved : undefined;
   const checks = gitlabChecks(mr);
+  const headSha = mr["diffHeadSha"], approved = mr["approved"], comments = mr["userNotesCount"];
+  const mergedAt = typeof mr["mergedAt"] === "string" ? Date.parse(mr["mergedAt"]) : NaN;
   return { state, draft: mr["draft"], title, headBranch,
-    ...(typeof mr["hasConflicts"] === "boolean" ? { hasConflicts: mr["hasConflicts"] } : {}),
+    ...(follow ? { activity: {
+      ...(typeof headSha === "string" && /^[0-9a-f]{40,64}$/iu.test(headSha) ? { headSha } : {}),
+      ...(state === "merged" && Number.isSafeInteger(mergedAt) ? { mergedAt } : {}),
+      ...(typeof approved === "boolean" ? { reviewDecision: approved ? "approved" : "not_approved" } : {}),
+      ...(typeof comments === "number" && Number.isSafeInteger(comments) && comments >= 0 ? { commentCount: comments } : {}),
+      ...(checks ? { checks: Object.entries(checks).map(([status, count]) => `${status}:${count}`) } : {}),
+      ...(typeof mr["conflicts"] === "boolean" ? { mergeState: mr["conflicts"] ? "conflicts" : "no_conflicts" } : {})
+    } } : {}),
+    ...(typeof mr["conflicts"] === "boolean" ? { hasConflicts: mr["conflicts"] } : {}),
     ...(unresolved === undefined ? {} : { unresolvedReviewThreadCount: unresolved }), ...(checks === undefined ? {} : { checks }) };
 }
 
