@@ -2,11 +2,28 @@ import { create } from "@bufbuild/protobuf";
 import * as wire from "@joko/contracts";
 import { createHash } from "node:crypto";
 import sharp from "sharp";
-import { expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createMobileGroupMedia } from "./mobile-partner-group-media";
+import { MobileImageOutput, mobileImageOutputTesting } from "./mobile-image-output";
 import { MobileMediaPreviewFiles } from "./mobile-media-preview";
 import { MobileModelPreviewFiles } from "./mobile-model-preview";
 import type { MobilePdfPreviewLease } from "./mobile-pdf-preview";
+
+const photos = vi.hoisted(() => ({
+  platform: { OS: "ios", Version: 28 }, permission: vi.fn<() => Promise<boolean>>(), write: vi.fn()
+}));
+vi.mock("expo-crypto", () => ({ randomUUID: () => "image-id" }));
+vi.mock("expo-modules-core", () => ({ requireNativeModule: () => ({ saveImage: photos.write }) }));
+vi.mock("expo-media-library/legacy", () => ({
+  isAvailableAsync: async () => true, getPermissionsAsync: async () => ({ granted: false, canAskAgain: true }),
+  requestPermissionsAsync: async () => ({ granted: await photos.permission() }), saveToLibraryAsync: photos.write
+}));
+vi.mock("react-native", () => ({
+  Platform: photos.platform, PermissionsAndroid: {
+    PERMISSIONS: { WRITE_EXTERNAL_STORAGE: "write" }, RESULTS: { GRANTED: "granted" },
+    request: async () => await photos.permission() ? "granted" : "denied"
+  }
+}));
 
 async function fixture(file?: { readonly mediaType: string; readonly name: string; readonly category: wire.PartnerGroupAttachmentCategory; readonly bytes: Uint8Array }) {
   const bytes = file?.bytes ?? Uint8Array.from(await sharp({ create: { width: 4, height: 3, channels: 3, background: "orange" } }).png().toBuffer());
@@ -51,6 +68,61 @@ it("rejects a late verified image download after the mobile profile owner has re
   f.download.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
   const pending = f.tools.prepareMediaImage(f.group, f.message, f.attachment, new AbortController().signal);
   await vi.waitFor(() => expect(f.download).toHaveBeenCalled()); f.retire(); finish({ bytes: f.bytes, mediaType: "image/png" }); await expect(pending).rejects.toThrow(/Owner changed/);
+});
+
+it("rechecks the image lease when the last group read completes", async () => {
+  const f = await fixture(), signal = new AbortController().signal;
+  const session = await f.tools.prepareMediaImage(f.group, f.message, f.attachment, signal);
+  const decoded = { width: 4, height: 3, mediaType: "image/png", isAnimated: false };
+  f.tools.confirmMediaImage(session.leaseId, decoded);
+  const output = await f.tools.prepareMediaOutput(session.leaseId, decoded, signal);
+  const response = await f.get();
+  let finish!: (current: typeof response) => void;
+  f.get.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const checking = output.assertCurrent();
+  f.tools.closeMediaImage(session.leaseId);
+  finish(response);
+  await expect(checking).rejects.toThrow(/closed/u);
+  const reads = f.get.mock.calls.length;
+  await expect(output.assertCurrent()).rejects.toThrow(/closed/u);
+  expect(f.get).toHaveBeenCalledTimes(reads);
+});
+
+describe.each(["ios", "android"])("%s group image save after the photo permission prompt", platform => {
+  it.each(["revoked", "message removed", "closed", "cancelled", "granted"])("%s", async outcome => {
+    photos.platform.OS = platform;
+    photos.write.mockClear();
+    const f = await fixture(), controller = new AbortController();
+    const session = await f.tools.prepareMediaImage(f.group, f.message, f.attachment, controller.signal);
+    const decoded = { width: 4, height: 3, mediaType: "image/png", isAnimated: false };
+    f.tools.confirmMediaImage(session.leaseId, decoded);
+    const output = await f.tools.prepareMediaOutput(session.leaseId, decoded, controller.signal);
+    let grant!: (allowed: boolean) => void, prompted!: () => void;
+    const prompt = new Promise<void>(resolve => { prompted = resolve; });
+    photos.permission.mockImplementationOnce(() => new Promise(resolve => { grant = resolve; prompted(); }));
+    const file = { uri: "file:///cache/group.png", fileName: "group.png" };
+    const removeTemporary = vi.fn(async () => {});
+    const publisher = new MobileImageOutput({
+      maintain: vi.fn(), copyImage: vi.fn(), writeTemporary: async () => file, removeTemporary,
+      saveImage: mobileImageOutputTesting.saveImage, shareImage: vi.fn(), sharingAvailable: vi.fn()
+    });
+    const saving = publisher.perform("save", output.source, undefined, controller.signal, output.assertCurrent);
+    await prompt;
+    expect(photos.write).not.toHaveBeenCalled();
+    if (outcome === "revoked") f.retire();
+    if (outcome === "message removed") f.hide();
+    if (outcome === "closed") f.tools.closeMediaImage(session.leaseId);
+    if (outcome === "cancelled") controller.abort();
+    grant(true);
+    if (outcome === "granted") {
+      await saving;
+      expect(photos.write.mock.calls).toEqual([platform === "ios" ? [file.uri] : [file.uri, file.fileName, "image/png"]]);
+    } else {
+      await expect(saving).rejects.toThrow(/owner changed|source changed|closed|abort/iu);
+      expect(photos.write).not.toHaveBeenCalled();
+    }
+    expect(removeTemporary).toHaveBeenCalledExactlyOnceWith(file);
+  });
 });
 
 it("opens the ready text attachment only through its original readable group and rejects changed bytes", async () => {

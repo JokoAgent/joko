@@ -60,7 +60,7 @@ describe("mobile image output", () => {
 
     await output.perform("save", pngSource());
     expect(driver.writeTemporary).toHaveBeenCalledWith("photo-id.png", "image/png", expect.any(Uint8Array));
-    expect(driver.saveImage).toHaveBeenCalledWith(temporary, "image/png");
+    expect(driver.saveImage).toHaveBeenCalledWith(temporary, "image/png", expect.any(Function));
     expect(driver.removeTemporary).toHaveBeenCalledWith(temporary);
 
     const failure = createDriver({
@@ -76,7 +76,7 @@ describe("mobile image output", () => {
     const output = new MobileImageOutput(driver, () => "id");
 
     await expect(output.perform("save", pngSource())).resolves.toBeUndefined();
-    expect(driver.saveImage).toHaveBeenCalledExactlyOnceWith(temporary, "image/png");
+    expect(driver.saveImage).toHaveBeenCalledExactlyOnceWith(temporary, "image/png", expect.any(Function));
     expect(driver.removeTemporary).toHaveBeenCalledExactlyOnceWith(temporary);
     expect(driver.saveImage.mock.invocationCallOrder[0]).toBeLessThan(driver.removeTemporary.mock.invocationCallOrder[0]!);
 

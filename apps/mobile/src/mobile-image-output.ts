@@ -43,7 +43,7 @@ export interface MobileImageOutputDriver {
   copyImage(base64: string): Promise<void>;
   writeTemporary(fileName: string, mediaType: string, bytes: Uint8Array): Promise<MobileImageOutputTemporaryFile>;
   removeTemporary(file: MobileImageOutputTemporaryFile): Promise<void>;
-  saveImage(file: MobileImageOutputTemporaryFile, mediaType: string): Promise<void>;
+  saveImage(file: MobileImageOutputTemporaryFile, mediaType: string, beforeWrite: () => Promise<void>): Promise<void>;
   sharingAvailable(): Promise<boolean>;
   shareImage(file: MobileImageOutputTemporaryFile, mediaType: string): Promise<void>;
 }
@@ -113,10 +113,15 @@ export class MobileImageOutput {
       let retainForShare = false;
       try {
         signal?.throwIfAborted();
-        await beforeDispatch?.();
-        signal?.throwIfAborted();
-        if (action === "save") await this.driver.saveImage(file, output.mediaType);
-        else {
+        if (action === "save") {
+          await this.driver.saveImage(file, output.mediaType, async () => {
+            signal?.throwIfAborted();
+            await beforeDispatch?.();
+            signal?.throwIfAborted();
+          });
+        } else {
+          await beforeDispatch?.();
+          signal?.throwIfAborted();
           retainForShare = true;
           await this.driver.shareImage(file, output.mediaType);
         }
@@ -237,7 +242,7 @@ const expoMobileImageOutputDriver: MobileImageOutputDriver = {
     if (!target.uri.startsWith(prefix)) throw new Error("Refusing to remove a file outside the image output cache.");
     if (target.exists) target.delete();
   },
-  async saveImage(file, mediaType) {
+  async saveImage(file, mediaType, beforeWrite) {
     if (Platform.OS === "ios") {
       const MediaLibrary = await import("expo-media-library/legacy");
       if (!await MediaLibrary.isAvailableAsync()) throw new Error("Saving images is unavailable on this device.");
@@ -247,6 +252,7 @@ const expoMobileImageOutputDriver: MobileImageOutputDriver = {
         permission = await MediaLibrary.requestPermissionsAsync(true);
       }
       if (!permission.granted) throw new Error("Photo-library add access was not granted.");
+      await beforeWrite();
       await MediaLibrary.saveToLibraryAsync(file.uri);
       return;
     }
@@ -269,6 +275,7 @@ const expoMobileImageOutputDriver: MobileImageOutputDriver = {
       }
     }
     const native = requireNativeModule<NativeAndroidImageOutput>("JokoImageOutput");
+    await beforeWrite();
     await native.saveImage(file.uri, file.fileName, mediaType);
   },
   async sharingAvailable() {
@@ -288,6 +295,7 @@ const expoMobileImageOutputDriver: MobileImageOutputDriver = {
 export const mobileImageOutput = new MobileImageOutput();
 
 export const mobileImageOutputTesting = {
+  saveImage: expoMobileImageOutputDriver.saveImage,
   outputFileName,
   outputRootDirectory
 };

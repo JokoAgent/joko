@@ -141,7 +141,12 @@ export function createMobileGroupMedia(input: {
     prepareMediaOutput: async (id: string, decoded: MobileImageGalleryNativeDecode, signal: AbortSignal): Promise<{ source: MobileImageOutputSource; assertCurrent(): Promise<void> }> => {
       const owned = lease(id, signal); if (!owned.confirmed) throw new Error("Confirm the decoded group image before output.");
       await revalidate(owned, signal); const parsed = inspectMobileImageOutputBytes(owned.bytes, owned.session.sourceMediaType, decoded);
-      const assertCurrent = async () => { if (lease(id, signal) !== owned) throw new Error("The group image output owner changed."); await revalidate(owned, signal); };
+      const assertLease = () => { if (lease(id, signal) !== owned) throw new Error("The group image output owner changed."); };
+      const assertCurrent = async () => {
+        assertLease();
+        await revalidate(owned, signal);
+        assertLease();
+      };
       return { source: { leaseId: id, fileName: owned.attachment.name, mediaType: parsed.mediaType, byteSize: owned.bytes.length,
         sha256Hex: owned.attachment.blob!.sha256Hex, bytes: owned.bytes, width: parsed.width, height: parsed.height }, assertCurrent };
     },
