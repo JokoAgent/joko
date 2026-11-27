@@ -86,6 +86,7 @@ import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ModelWorkingContextCoordinator } from "./model-working-context.js";
 import { SessionContextBudgetCoordinator } from "./session-context-budget.js";
 import { ArtifactStore } from "./artifact-store.js";
+import { HistoryMaintenance } from "./history-maintenance.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import { ConnectionManager } from "./connection-manager.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -18184,6 +18185,29 @@ describe("SessionHost", () => {
     expect(fixture.store.listQueueItems({ sessionId }).some(item => item.operationId === "delete-admission-racing-input")).toBe(false);
     close.release();
     await expect(deletion).resolves.toMatchObject({ value: ["delete-admission-user"] });
+  });
+
+  it("keeps the accepted run and its host resources when history cleanup loses the idle window", async () => {
+    const adapter = new SessionResetFakeAdapter(), closed = vi.fn();
+    const { host, store, connection } = await createFixture(adapter, { onSessionRuntimeClosed: closed });
+    const { sessionId } = (await host.createSession({ operationId: "history-busy-create", connection, targetId: "target-one",
+      title: "Busy after scan", fastMode: false, permissionMode: "ask", planMode: false })).value;
+    appendSessionEvent(store, sessionId, "old-answer", 10, { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "old" }] });
+    const maintenance = new HistoryMaintenance({ store, now: () => Date.now() + 8 * 86_400_000,
+      activeSessions: { prepare: (requests, check) => host.prepareHistoryMaintenanceBindings(requests, check),
+        release: ids => host.releaseHistoryMaintenanceSessions(ids) } });
+    const scan = maintenance.scan({ retention: "7-days", includeActiveTasks: true });
+    expect(scan.activeTaskCount).toBe(1);
+    vi.spyOn(adapter, "send").mockResolvedValue(undefined);
+    const run = host.enqueueInput({ operationId: "history-busy-send", connection, sessionId,
+      prompt: { text: "keep running", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    await eventually(() => store.getQueueItem(run.queueItemId).state === "backend_accepted");
+    closed.mockClear();
+    await expect(maintenance.cleanup(scan.scanId, false, connection)).rejects.toThrow("maintenance failed");
+    expect(host.isSessionActive(sessionId)).toBe(true);
+    expect(closed).not.toHaveBeenCalled();
+    expect(store.getQueueItem(run.queueItemId).state).toBe("backend_accepted");
+    expect(store.getRun(run.runId).descriptor.state).toBe("running");
   });
 
   it("clears context in place while switching to a fresh empty native Session", async () => {

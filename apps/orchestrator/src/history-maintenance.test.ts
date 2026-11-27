@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import type { EventPayload, SessionDescriptor } from "@joko/core";
-import { OperationalStore, type ConnectionRecord } from "@joko/store";
+import { OperationalStore, operationBodyHash, type ConnectionRecord } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
@@ -165,6 +165,49 @@ describe("HistoryMaintenance", () => {
     }
   });
 
+  it("keeps yesterday's reply in an old task and fences new events by sequence at confirmation", async () => {
+    const { store, connection } = createFixture();
+    for (const id of ["recent-reply", "after-scan"]) createTask(store, id, "active", OLD, visible("old answer"));
+    const answer = (sessionId: string, emittedAt: number) => store.appendEvent({
+      sessionId, targetId: "target-1", backendId: "runtime", generation: 0, emittedAt,
+      traceId: sessionId, payload: visible("new answer")
+    });
+    answer("recent-reply", RECENT);
+    const maintenance = new HistoryMaintenance({ store, now: () => NOW,
+      activeSessions: { prepare: async ([request]) => [{ ...request!, replacement: { opaqueRef: "fresh", generation: 1 } }],
+        release: () => undefined, discard: async () => undefined },
+      workDatabase: async input => cleanHistoryMaintenanceCopy(input) });
+    const scan = maintenance.scan({ retention: "7-days", includeActiveTasks: true });
+    expect(scan).toMatchObject({ activeTaskCount: 1, messageCount: 1 });
+    answer("after-scan", OLD);
+    expect(await maintenance.cleanup(scan.scanId, false, connection)).toMatchObject({
+      outcome: "completed", result: { messageCount: 0, skippedTaskCount: 1 }
+    });
+    for (const id of ["recent-reply", "after-scan"]) {
+      expect(store.listEvents({ sessionId: id }).filter(event => event.payload.type === "message_complete")).toHaveLength(2);
+      expect(store.getSession(id).descriptor.binding.generation).toBe(0);
+    }
+  });
+
+  it.each([
+    ["1-month", "2026-03-31", "2026-02-28"],
+    ["1-month", "2024-03-31", "2024-02-29"],
+    ["3-months", "2026-05-31", "2026-02-28"],
+    ["6-months", "2026-03-31", "2025-09-30"]
+  ] as const)("clamps %s before %s to the last available UTC day %s", async (retention, today, cutoff) => {
+    const { store, connection } = createFixture();
+    const noon = (day: string) => Date.parse(day + "T12:00:00.123Z");
+    createTask(store, "at-cutoff", "archived", noon(cutoff), visible("old enough"));
+    createTask(store, "after-cutoff", "archived", noon(cutoff) + 1, visible("keep me"));
+    const maintenance = new HistoryMaintenance({ store, now: () => noon(today),
+      activeSessions: { prepare: async () => [], release: () => undefined },
+      workDatabase: async input => cleanHistoryMaintenanceCopy(input) });
+    const scan = maintenance.scan({ retention, includeActiveTasks: false });
+    expect(scan).toMatchObject({ olderThan: noon(cutoff), archivedTaskCount: 1 });
+    expect(await maintenance.cleanup(scan.scanId, false, connection)).toMatchObject({ result: { messageCount: 1 } });
+    expect(store.listEvents({ sessionId: "after-cutoff" }).map(event => event.payload)).toContainEqual(visible("keep me"));
+  });
+
   it("skips a task whose status or native binding changed after the scan", async () => {
     const fixture = createFixture();
     createTask(fixture.store, "archived-old", "archived", OLD, visible("keep after change"));
@@ -187,6 +230,57 @@ describe("HistoryMaintenance", () => {
       scope: { sessionId: "archived-old" },
       query: "keep after change"
     }).matches).toHaveLength(1);
+  });
+
+  it("prunes both archived transcripts and preserves the channel's settled admission on replay", async () => {
+    const { store, connection } = createFixture();
+    createTask(store, "channel", "active", OLD, visible("old channel reply"));
+    createTask(store, "ordinary", "archived", OLD, visible("old ordinary reply"));
+    const initial = store.createMessagingConnection({ channel: "telegram", ownerProviderUserId: "42", configuration: {} });
+    store.putMessagingRoute({ targetId: "target-1", fastMode: false, permissionMode: "ask", planMode: false });
+    const channel = store.replaceMessagingCredential({ connectionId: initial.id, expectedRevision: initial.revision,
+      expectedGeneration: initial.generation, credentialReferenceId: "test-ref", credentialGeneration: "1".repeat(64), enable: true });
+    const conversation = store.ensureMessagingConversation({ connectionId: channel.id, expectedChannelGeneration: channel.generation,
+      providerConversationId: "42", conversationKind: "direct" });
+    store.bindMessagingConversation({ conversationId: conversation.id, expectedRevision: conversation.revision,
+      expectedChannelGeneration: channel.generation, sessionId: "channel", expectedSessionGeneration: 0, routeScopeKey: "global" });
+    const message = { connectionId: channel.id, expectedChannelGeneration: channel.generation, conversationId: conversation.id,
+      providerRequestIds: ["telegram:update:7"], bodyHash: operationBodyHash({ text: "old input" }), protectedContent: false, occurredAt: OLD };
+    const inbound = store.createMessagingInboundRequest(message).request;
+    addTerminalTurn(store, "channel", () => {
+      const queued = store.bindMessagingInboundAdmission({ requestId: inbound.id, expectedRevision: inbound.revision,
+        conversationId: conversation.id, operationId: "operation-channel", runId: "run-channel", attemptId: "attempt-channel", queueItemId: "queue-channel" });
+      store.updateMessagingInboundRequestStatus({ requestId: inbound.id, expectedRevision: queued.revision, status: "completed" });
+    });
+    store.updateSession("channel", { archived: true }, store.getSession("channel").revision, OLD);
+    const maintenance = new HistoryMaintenance({ store, now: () => NOW,
+      activeSessions: { prepare: async () => [], release: () => undefined }, workDatabase: async input => cleanHistoryMaintenanceCopy(input) });
+    const scan = maintenance.scan({ retention: "7-days", includeActiveTasks: false });
+    expect(await maintenance.cleanup(scan.scanId, false, connection)).toMatchObject({
+      outcome: "completed", result: { archivedTaskCount: 2, messageCount: 2, skippedTaskCount: 0 }
+    });
+    for (const id of ["channel", "ordinary"]) expect(store.listEvents({ sessionId: id }).map(event => event.payload.type)).toEqual(["history_pruned"]);
+    expect(store.createMessagingInboundRequest(message)).toMatchObject({ created: false, request: { id: inbound.id, status: "completed", queueItemId: "queue-channel" } });
+  });
+
+  it("discards a skipped replacement while finalizing the adopted one only once across recovery", async () => {
+    const { store, connection } = createFixture();
+    for (const id of ["changed", "adopted"]) createTask(store, id, "active", OLD, visible(id));
+    const discard = vi.fn(async () => undefined), finalize = vi.fn(async () => undefined);
+    const maintenance = new HistoryMaintenance({ store, now: () => NOW, activeSessions: {
+      prepare: async requests => requests.map(request => ({ ...request, replacement: { opaqueRef: "empty-" + request.sessionId, generation: 1 } })),
+      discard, finalize, release: () => undefined
+    }, workDatabase: async input => cleanHistoryMaintenanceCopy(input) });
+    const scan = maintenance.scan({ retention: "7-days", includeActiveTasks: true });
+    store.updateSession("changed", { title: "Renamed" }, store.getSession("changed").revision, NOW);
+    expect(await maintenance.cleanup(scan.scanId, false, connection)).toMatchObject({ result: { activeTaskCount: 1, skippedTaskCount: 1 } });
+    await maintenance.initialize();
+    expect(discard).toHaveBeenCalledExactlyOnceWith([expect.objectContaining({ sessionId: "changed" })]);
+    expect(finalize).toHaveBeenCalledExactlyOnceWith([expect.objectContaining({ sessionId: "adopted" })]);
+    expect(store.listMaintenanceEffects(scan.scanId).filter(effect => effect.kind === "history_binding").map(effect => effect.state).sort())
+      .toEqual(["completed", "skipped"]);
+    expect(store.getSession("changed").descriptor.binding.generation).toBe(0);
+    expect(store.listEvents({ sessionId: "changed" }).map(event => event.payload)).toContainEqual(visible("changed"));
   });
 
   it("does not replace active history with a binding reserved for native derivation cleanup", async () => {
@@ -468,7 +562,7 @@ function visible(text: string): EventPayload {
   return { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] };
 }
 
-function addTerminalTurn(store: OperationalStore, sessionId: string): void {
+function addTerminalTurn(store: OperationalStore, sessionId: string, afterAdmission?: () => void): void {
   const runId = `run-${sessionId}`;
   const attemptId = `attempt-${sessionId}`;
   const queueItemId = `queue-${sessionId}`;
@@ -501,6 +595,7 @@ function addTerminalTurn(store: OperationalStore, sessionId: string): void {
     });
     return { accepted: true };
   });
+  afterAdmission?.();
   const backendInstanceGeneration = store.getBackend(store.getSession(sessionId).descriptor.backendId)
     .descriptor.instanceGeneration;
   store.claimNextQueueItem({ sessionId, backendInstanceGeneration, at: OLD + 1 });

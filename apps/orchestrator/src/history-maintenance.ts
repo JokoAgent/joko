@@ -6,7 +6,6 @@ import type {
   ConnectionRecord,
   MaintenanceEffectRecord,
   MaintenanceJobRecord,
-  OperationalHistoryMaintenanceCandidate,
   OperationalStore
 } from "@joko/store";
 
@@ -194,7 +193,7 @@ export class HistoryMaintenance {
     const olderThan = retentionCutoff(scannedAt, input.retention);
     const databasePath = resolve(this.#store.filePath);
     const inspection = this.#store.inspectHistoryMaintenance({ olderThan, includeActiveTasks: input.includeActiveTasks });
-    const candidates = inspection.candidates.map(toWorkCandidate);
+    const candidates = inspection.candidates;
     const databaseBytes = databaseFamilyBytes(databasePath);
     const temporaryBytesRequired = Math.max(0, Math.ceil(databaseBytes * 2 + SPACE_MARGIN_BYTES));
     const freeBytes = volumeFreeBytes(dirname(databasePath));
@@ -330,7 +329,7 @@ export class HistoryMaintenance {
   }
 
   async #execute(maintenanceId: string, signal: AbortSignal): Promise<void> {
-    let activeIds: string[] = [];
+    const preparedSessionIds: string[] = [];
     const databasePath = resolve(this.#store.filePath);
     const workingPath = `${databasePath}.history-maintenance.work`;
     try {
@@ -352,10 +351,9 @@ export class HistoryMaintenance {
         job.scanId
       );
       const bindingEffects = this.#bindingEffects(maintenanceId);
-      activeIds = bindingEffects.map((effect) => historyBindingEffect(effect.payload).sessionId);
       assertNotCancelled(signal, job.cancelRequested);
       this.#updateProgress(maintenanceId, "preparing", 5, true);
-      const replacements = await this.#prepareBindings(maintenanceId, bindingEffects, signal, assertCurrent);
+      const replacements = await this.#prepareBindings(maintenanceId, bindingEffects, signal, assertCurrent, preparedSessionIds);
       job = this.#store.getMaintenanceJob("history", maintenanceId);
       assertNotCancelled(signal, job.cancelRequested);
       assertCurrent();
@@ -454,7 +452,7 @@ export class HistoryMaintenance {
       throw error;
     } finally {
       rmSync(workingPath, { force: true });
-      if (activeIds.length > 0) this.#activeSessions.release(activeIds);
+      if (preparedSessionIds.length > 0) this.#activeSessions.release(preparedSessionIds);
     }
   }
 
@@ -462,7 +460,8 @@ export class HistoryMaintenance {
     maintenanceId: string,
     effects: readonly MaintenanceEffectRecord<DurableHistoryBindingEffect>[],
     signal: AbortSignal,
-    assertCurrent: () => void
+    assertCurrent: () => void,
+    preparedSessionIds: string[]
   ): Promise<HistoryBindingReplacement[]> {
     const replacements: HistoryBindingReplacement[] = [];
     for (const original of effects) {
@@ -511,6 +510,7 @@ export class HistoryMaintenance {
       });
       try {
         const prepared = await this.#activeSessions.prepare([request], assertCurrent);
+        preparedSessionIds.push(request.sessionId);
         if (prepared.length !== 1) throw new Error("Task history binding preparation returned an invalid result.");
         const replacement = prepared[0]!;
         assertReplacement(request, replacement);
@@ -681,26 +681,28 @@ export class HistoryMaintenance {
   async #reconcileTerminalReceipts(maintenanceId: string): Promise<void> {
     const job = this.#store.findMaintenanceJob<DurableHistoryJobPayload, HistoryMaintenanceResult>("history", maintenanceId);
     if (job?.status !== "completed") return;
-    const replacements = this.#preparedReplacements(maintenanceId);
-    if (replacements.length > 0) {
+    const adopted = new Set(historyJobPayload(job.payload).workResult?.activeSessionIds);
+    for (const effect of this.#bindingEffects(maintenanceId)) {
+      if (effect.state === "completed" || effect.state === "skipped") continue;
+      const payload = historyBindingEffect(effect.payload);
+      if (payload.replacement === undefined) continue;
+      const wasAdopted = adopted.has(payload.sessionId);
+      const replacement = { ...payload, replacement: payload.replacement };
       try {
-        if (this.#activeSessions.finalize === undefined) {
-          throw new Error("Task history binding finalization is unavailable.");
+        if (wasAdopted) {
+          if (!this.#activeSessions.finalize) throw new Error("Task history binding finalization is unavailable.");
+          await this.#activeSessions.finalize([replacement]);
+        } else {
+          if (!this.#activeSessions.discard) throw new Error("Task history binding discard is unavailable.");
+          await this.#activeSessions.discard([replacement]);
         }
-        await this.#activeSessions.finalize(replacements);
-        for (const effect of this.#bindingEffects(maintenanceId)) {
-          if (historyBindingEffect(effect.payload).replacement === undefined) continue;
-          this.#store.updateMaintenanceEffect({
-            jobId: maintenanceId, id: effect.id, state: "completed", payload: effect.payload, updatedAt: this.#now()
-          });
-        }
+        this.#store.updateMaintenanceEffect({
+          jobId: maintenanceId, id: effect.id, state: wasAdopted ? "completed" : "skipped", payload, updatedAt: this.#now()
+        });
       } catch {
-        for (const effect of this.#bindingEffects(maintenanceId)) {
-          if (historyBindingEffect(effect.payload).replacement === undefined) continue;
-          this.#store.updateMaintenanceEffect({
-            jobId: maintenanceId, id: effect.id, state: "unknown", payload: effect.payload, updatedAt: this.#now()
-          });
-        }
+        this.#store.updateMaintenanceEffect({
+          jobId: maintenanceId, id: effect.id, state: "unknown", payload, updatedAt: this.#now()
+        });
       }
     }
     const external = this.#store.listMaintenanceEffects<DurableHistoryExternalEffect>(maintenanceId)
@@ -731,18 +733,6 @@ export class HistoryMaintenance {
   #bindingEffects(maintenanceId: string): MaintenanceEffectRecord<DurableHistoryBindingEffect>[] {
     return this.#store.listMaintenanceEffects<DurableHistoryBindingEffect>(maintenanceId)
       .filter((effect) => effect.kind === "history_binding");
-  }
-
-  #preparedReplacements(maintenanceId: string): HistoryBindingReplacement[] {
-    return this.#bindingEffects(maintenanceId).flatMap((effect) => {
-      const payload = historyBindingEffect(effect.payload);
-      return payload.replacement === undefined ? [] : [{
-        sessionId: payload.sessionId,
-        operationId: payload.operationId,
-        source: payload.source,
-        replacement: payload.replacement
-      }];
-    });
   }
 
   #replaceJobPayload(
@@ -779,7 +769,9 @@ function retentionCutoff(now: number, retention: HistoryRetention): number {
   if (retention === "7-days") return now - 7 * 24 * 60 * 60_000;
   const months = retention === "1-month" ? 1 : retention === "3-months" ? 3 : 6;
   const date = new Date(now);
-  date.setUTCMonth(date.getUTCMonth() - months);
+  const day = date.getUTCDate();
+  date.setUTCMonth(date.getUTCMonth() - months + 1, 0);
+  date.setUTCDate(Math.min(day, date.getUTCDate()));
   return date.getTime();
 }
 
@@ -806,10 +798,6 @@ function volumeFreeBytes(directory: string): number | undefined {
 
 function assertNotCancelled(signal: AbortSignal, cancelRequested: boolean): void {
   if (signal.aborted || cancelRequested) throw new HistoryWorkCancelledError();
-}
-
-function toWorkCandidate(candidate: OperationalHistoryMaintenanceCandidate): HistoryWorkCandidate {
-  return { sessionId: candidate.sessionId, status: candidate.status, updatedAt: candidate.updatedAt, binding: candidate.binding };
 }
 
 function bindingEffectId(sessionId: string): string {

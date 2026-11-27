@@ -109,6 +109,7 @@ export interface FixtureOptions {
   readonly publicLanHost?: string;
   readonly terminals?: OrchestratorApplication["terminals"];
   readonly codeHostProviders?: OrchestratorApplication["codeHostProviders"];
+  readonly historyMaintenanceClock?: () => number;
   readonly scheduler?: Pick<ScheduleCoordinatorOptions, "now" | "heartbeatLeaseMs" | "pullRequestProviders">;
   readonly createAuxiliaryServices?: (
     store: OperationalStore,
@@ -386,6 +387,7 @@ export class OrchestratorE2eFixture {
     await sessionHost.initialize();
     const historyMaintenance = new HistoryMaintenance({
       store,
+      now: options.historyMaintenanceClock,
       activeSessions: {
         prepare: (sessionIds, assertCurrent) => sessionHost.prepareHistoryMaintenanceBindings(sessionIds, assertCurrent),
         recover: (request) => sessionHost.recoverHistoryMaintenanceBinding(request),

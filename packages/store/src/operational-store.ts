@@ -940,7 +940,7 @@ export class OperationalStore {
       SELECT session.id,
              CASE WHEN session.deleted_at IS NOT NULL THEN 'deleted'
                   WHEN session.archived = 1 THEN 'archived' ELSE 'active' END AS status,
-             session.updated_at, session.native_opaque_ref, session.native_session_id, session.generation,
+             session.updated_at, counter.last_sequence, session.native_opaque_ref, session.native_session_id, session.generation,
              (SELECT COUNT(*) FROM events AS event
                WHERE event.session_id = session.id
                  AND json_extract(event.payload_json, '$.payload.type') = 'message_complete') AS message_count,
@@ -958,23 +958,25 @@ export class OperationalStore {
                  + length(CAST(COALESCE(interaction.decision_json, '') AS BLOB))
                ), 0) FROM interactions AS interaction WHERE interaction.session_id = session.id) AS interaction_bytes
         FROM product_sessions AS session
+        JOIN session_event_counters AS counter ON counter.session_id = session.id
        WHERE session.updated_at <= ?
          AND (
            session.deleted_at IS NOT NULL
            OR session.archived = 1
            OR (? = 1 AND session.deleted_at IS NULL AND session.archived = 0)
          )
-         AND EXISTS (
-           SELECT 1 FROM events AS event
+         AND (
+           SELECT MAX(event.emitted_at) FROM events AS event
             WHERE event.session_id = session.id
               AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
-         )
+         ) <= ?
        ORDER BY session.id
-    `).all(input.olderThan, input.includeActiveTasks ? 1 : 0) as Row[];
+    `).all(input.olderThan, input.includeActiveTasks ? 1 : 0, input.olderThan) as Row[];
     const candidates = rows.map((row) => ({
       sessionId: stringValue(row["id"]),
       status: enumValue(row["status"], ["active", "archived", "deleted"] as const),
       updatedAt: numberValue(row["updated_at"]),
+      eventSequence: toBigInt(row["last_sequence"]).toString(),
       binding: {
         opaqueRef: stringValue(row["native_opaque_ref"]),
         ...optionalString("nativeSessionId", row["native_session_id"]),
@@ -12874,6 +12876,13 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.inputHandoffContinuation') IS NULL
         AND json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL
       LIMIT 1`).get(sessionId, asSqlInteger(afterCursor)) !== undefined;
+  }
+
+  latestSessionMessageAt(sessionId: string): number | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`SELECT MAX(emitted_at) AS at FROM events
+      WHERE session_id = ? AND json_extract(payload_json, '$.payload.type') = 'message_complete'`).get(sessionId) as Row;
+    return row["at"] == null ? undefined : numberValue(row["at"]);
   }
 
   /**

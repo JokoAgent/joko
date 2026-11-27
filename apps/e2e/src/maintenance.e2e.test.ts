@@ -1,12 +1,12 @@
 import { stat } from "node:fs/promises";
 
-import { ArtifactStorageCleanupStatus, TaskHistoryMaintenanceStatus, TaskHistoryRetention } from "@joko/contracts";
+import { ArtifactStorageCleanupStatus, OperationState, TaskHistoryMaintenanceStatus, TaskHistoryRetention } from "@joko/contracts";
 import type { AdapterContext, NativeSessionBinding } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { expect, it } from "vitest";
 
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
-import { createSessionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import { archiveMutation, createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 it("confirms Artifact cleanup through authenticated HTTP, resumes the same receipt, and retains the result after service restart", async () => {
   let fixture = await OrchestratorE2eFixture.start();
@@ -73,8 +73,10 @@ it("prunes archived and explicitly included active task history through authenti
       if (context.operationId !== undefined) this.receipts.delete(context.operationId);
     }
   }
+  let maintenanceTime = Date.now();
   const start = (rootDirectory?: string) => OrchestratorE2eFixture.start({
     createAdapter: (profile) => new RecoverableAdapter(profile),
+    historyMaintenanceClock: () => maintenanceTime,
     ...(rootDirectory === undefined ? {} : { rootDirectory })
   });
   let fixture = await start();
@@ -83,26 +85,31 @@ it("prunes archived and explicitly included active task history through authenti
     const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
       createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId: fixture.targetId() })));
     const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
-    await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, generation, "old task history"));
-    await waitFor(async () => fixture.application.store.listEvents({ sessionId }),
-      (events) => events.some((event) => event.payload.type === "message_complete"), "task message");
-    const source = fixture.application.store.getSession(sessionId);
-    fixture.application.store.updateSession(sessionId, { archived: true }, source.revision, Date.now() - 8 * 24 * 60 * 60_000);
+    const archivedRun = queueRunIdFrom(await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, generation, "old task history")));
+    await waitFor(async () => fixture.application.store.listQueueItems({ sessionId }),
+      (items) => items.some((item) => item.state === "completed"), "task completion before archive");
+    const waitForWorkspaceDiff = (taskId: string, runId: string) => waitFor(
+      async () => fixture.application.store.listEvents({ sessionId: taskId }).some(event => event.runId === runId && event.payload.type === "workspace_diff"),
+      persisted => persisted, "the completed run's durable workspace diff"
+    );
+    await waitForWorkspaceDiff(sessionId, archivedRun);
+    const archived = await submit(paired.clients.operation, paired.connectionId, archiveMutation(sessionId, true));
+    expect(archived.state, archived.error?.message).toBe(OperationState.SUCCEEDED);
     const activeSessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
       createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId: fixture.targetId() })));
     const activeGeneration = BigInt(fixture.application.store.getSession(activeSessionId).descriptor.binding.generation);
-    await submit(paired.clients.operation, paired.connectionId,
-      sendInputMutation(activeSessionId, activeGeneration, "old active context"));
+    const activeRun = queueRunIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      sendInputMutation(activeSessionId, activeGeneration, "old active context")));
     await waitFor(async () => fixture.application.store.listQueueItems({ sessionId: activeSessionId }),
       (items) => items.some((item) => item.state === "completed"), "active task completion");
-    const activeSource = fixture.application.store.getSession(activeSessionId);
-    fixture.application.store.updateSession(activeSessionId, {}, activeSource.revision,
-      Date.now() - 8 * 24 * 60 * 60_000);
+    await waitForWorkspaceDiff(activeSessionId, activeRun);
     const sourceBinding = fixture.application.store.getSession(activeSessionId).descriptor.binding;
 
-    const scan = (await paired.clients.historyMaintenance.scanTaskHistory({
-      retention: TaskHistoryRetention.SEVEN_DAYS, includeActiveTasks: true
-    })).scan!;
+    const retention = { retention: TaskHistoryRetention.SEVEN_DAYS, includeActiveTasks: true };
+    const recent = await paired.clients.historyMaintenance.scanTaskHistory(retention);
+    expect(recent.scan).toMatchObject({ archivedTaskCount: 0n, activeTaskCount: 0n, messageCount: 0n });
+    maintenanceTime = Date.now() + 8 * 24 * 60 * 60_000;
+    const scan = (await paired.clients.historyMaintenance.scanTaskHistory(retention)).scan!;
     expect(scan.archivedTaskCount).toBe(1n);
     expect(scan.activeTaskCount).toBe(1n);
     expect(scan.messageCount).toBeGreaterThan(1n);
@@ -127,7 +134,7 @@ it("prunes archived and explicitly included active task history through authenti
     fixture = await start(root);
     const client = fixture.clients(paired.authKey).historyMaintenance;
     expect((await client.getTaskHistoryCleanup({ maintenanceId: scan.scanId })).progress)
-      .toMatchObject({ status: TaskHistoryMaintenanceStatus.COMPLETED });
+      .toMatchObject({ maintenanceId: scan.scanId, status: TaskHistoryMaintenanceStatus.COMPLETED, result: terminal.result });
     expect(fixture.application.store.getSession(sessionId).descriptor.archived).toBe(true);
     expect(fixture.application.store.getSession(activeSessionId).descriptor.binding).not.toEqual(sourceBinding);
     expect(fixture.application.store.listEvents({ sessionId }).filter((event) => event.payload.type === "history_pruned"))

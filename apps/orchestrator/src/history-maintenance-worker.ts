@@ -3,17 +3,13 @@ import { isMainThread, parentPort, Worker, workerData } from "node:worker_thread
 import { DatabaseSync } from "node:sqlite";
 
 import type { SessionDescriptor } from "@joko/core";
+import type { OperationalHistoryMaintenanceCandidate } from "@joko/store";
 import * as sqliteVec from "sqlite-vec";
 
 const ACTIVE_RUN_STATES = "'queued','running','waiting','retrying','dispatch_unknown'";
 const ACTIVE_QUEUE_STATES = "'accepted','dispatching','backend_accepted','dispatch_unknown'";
 
-export interface HistoryWorkCandidate {
-  readonly sessionId: string;
-  readonly status: "active" | "archived" | "deleted";
-  readonly updatedAt: number;
-  readonly binding: SessionDescriptor["binding"];
-}
+export type HistoryWorkCandidate = OperationalHistoryMaintenanceCandidate;
 
 export interface HistoryWorkBindingReplacement {
   readonly sessionId: string;
@@ -113,6 +109,7 @@ export function cleanHistoryMaintenanceCopy(
           session_id TEXT PRIMARY KEY,
           status TEXT NOT NULL,
           expected_updated_at INTEGER NOT NULL,
+          expected_sequence TEXT,
           source_opaque_ref TEXT NOT NULL,
           source_native_session_id TEXT,
           source_generation INTEGER NOT NULL,
@@ -124,10 +121,10 @@ export function cleanHistoryMaintenanceCopy(
       const replacementBySession = new Map(input.replacements.map((item) => [item.sessionId, item]));
       const insert = database.prepare(`
         INSERT INTO history_targets(
-          session_id, status, expected_updated_at, source_opaque_ref,
+          session_id, status, expected_updated_at, expected_sequence, source_opaque_ref,
           source_native_session_id, source_generation, replacement_opaque_ref,
           replacement_native_session_id, replacement_generation
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       for (const candidate of input.candidates) {
         const replacement = replacementBySession.get(candidate.sessionId);
@@ -135,6 +132,7 @@ export function cleanHistoryMaintenanceCopy(
           candidate.sessionId,
           candidate.status,
           candidate.updatedAt,
+          candidate.eventSequence ?? null,
           candidate.binding.opaqueRef,
           candidate.binding.nativeSessionId ?? null,
           candidate.binding.generation,
@@ -147,8 +145,10 @@ export function cleanHistoryMaintenanceCopy(
         DELETE FROM history_targets
         WHERE NOT EXISTS (
           SELECT 1 FROM product_sessions AS session
+          JOIN session_event_counters AS counter ON counter.session_id = session.id
           WHERE session.id = history_targets.session_id
             AND session.updated_at = history_targets.expected_updated_at
+            AND CAST(counter.last_sequence AS TEXT) = history_targets.expected_sequence
             AND session.native_opaque_ref = history_targets.source_opaque_ref
             AND session.native_session_id IS history_targets.source_native_session_id
             AND session.generation = history_targets.source_generation
@@ -168,6 +168,12 @@ export function cleanHistoryMaintenanceCopy(
            OR EXISTS (
              SELECT 1 FROM queue_items WHERE queue_items.session_id = history_targets.session_id
                AND queue_items.state IN (${ACTIVE_QUEUE_STATES})
+           )
+           OR EXISTS (
+             SELECT 1 FROM queue_items AS queue JOIN messaging_inbound_requests AS request
+               ON request.queue_item_id = queue.id
+             WHERE queue.session_id = history_targets.session_id
+               AND request.status NOT IN ('completed', 'failed', 'cancelled')
            )
            OR EXISTS (
              SELECT 1 FROM interactions WHERE interactions.session_id = history_targets.session_id
@@ -240,11 +246,14 @@ export function cleanHistoryMaintenanceCopy(
         DELETE FROM events WHERE global_cursor IN (SELECT event_cursor FROM history_events);
         DELETE FROM interactions WHERE session_id IN (SELECT session_id FROM history_targets);
         DELETE FROM tool_leases WHERE session_id IN (SELECT session_id FROM history_targets);
-        DELETE FROM queue_items WHERE session_id IN (SELECT session_id FROM history_targets);
+        -- The channel owns its admission receipt and the exact Queue lineage it references.
+        DELETE FROM queue_items WHERE session_id IN (SELECT session_id FROM history_targets)
+          AND NOT EXISTS (SELECT 1 FROM messaging_inbound_requests WHERE queue_item_id = queue_items.id);
         UPDATE runs SET parent_run_id = NULL WHERE parent_run_id IN (
           SELECT run.id FROM runs AS run JOIN history_targets AS target ON target.session_id = run.session_id
         );
-        DELETE FROM runs WHERE session_id IN (SELECT session_id FROM history_targets);
+        DELETE FROM runs WHERE session_id IN (SELECT session_id FROM history_targets)
+          AND NOT EXISTS (SELECT 1 FROM messaging_inbound_requests WHERE run_id = runs.id);
         DELETE FROM review_runs
           WHERE state <> 'running' AND (
             source_session_id IN (SELECT session_id FROM history_targets WHERE status = 'active')

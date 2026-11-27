@@ -56,6 +56,7 @@ export interface OperationalHistoryMaintenanceCandidate {
   readonly sessionId: string;
   readonly status: "active" | "archived" | "deleted";
   readonly updatedAt: number;
+  readonly eventSequence: string;
   readonly binding: SessionDescriptor["binding"];
 }
 
