@@ -31,7 +31,7 @@ jobs:
           git init -q "$RUNNER_TEMP/ignore-reference"
           cd "$RUNNER_TEMP/ignore-reference"
           printf '%s\n' 'generated**.ts' 'case[[:digit:]].ts' > .gitignore
-          git check-ignore -v -n -- generated-file.ts generated-tools/visible.ts case1.ts caseA.ts
+          git -c core.quotepath=false check-ignore -v -n -- generated-file.ts generated-tools/visible.ts case1.ts caseA.ts case１.ts
       - name: Interrupted cleanup and workspace symbol filtering
         shell: bash
         run: |
