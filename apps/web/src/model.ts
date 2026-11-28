@@ -2999,7 +2999,7 @@ export interface SchedulerRuntimeView {
 }
 
 export interface ScheduleDraft {
-  readonly original?: Pick<ScheduleView, "id" | "revision" | "input" | "inputText">;
+  readonly original?: Pick<ScheduleView, "id" | "revision" | "input" | "inputText"> & Partial<Pick<ScheduleView, "timezone" | "expireAt">>;
   readonly taskModelGroupId?: string;
   readonly name: string;
   readonly backendId: string;
