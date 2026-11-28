@@ -82,25 +82,33 @@ export function PartnerNetworkSection({ controller, partners }: { controller: Ap
 function NetworkEntry({ api, m, kind, partners, owner, onClose, onJoined }: { api: PartnerNetworkApi; m: Copy; kind: "create" | "join"; partners: readonly PartnerProfileView[]; owner: string; onClose(): void; onJoined(room: wire.PartnerNetworkRoom): void }) {
   const [name, setName] = useState(""), [displayName, setDisplayName] = useState(""), [selected, setSelected] = useState<string[]>([]), [invitation, setInvitation] = useState(""), [preview, setPreview] = useState<wire.PreviewPartnerNetworkResponse>(), [error, setError] = useState<string>(), [busy, setBusy] = useState(false);
   const lifetime = useRef(new AbortController());
+  const invitationInput = useRef(invitation);
   const journal = useMemo(() => new PartnerNetworkEntryJournal(window.localStorage, owner), [owner]);
   useEffect(() => () => lifetime.current.abort(), []);
   const act = async () => {
     if (busy) return; setBusy(true); setError(undefined);
+    const current = () => !lifetime.current.signal.aborted && invitationInput.current === invitation;
     try {
       const body = JSON.stringify([kind, name, displayName, selected, invitation]), retained = await journal.read(body);
-      if (kind === "join" && !preview && !retained) { const result = await api.previewPartnerNetwork({ invitation }, { signal: lifetime.current.signal }); if (!lifetime.current.signal.aborted) setPreview(result); return; }
-      const operationId = retained ?? await journal.prepare(body); lifetime.current.signal.throwIfAborted();
+      if (!current()) return;
+      if (kind === "join" && !preview && !retained) {
+        const result = await api.previewPartnerNetwork({ invitation }, { signal: lifetime.current.signal });
+        if (!result.room) throw new Error(m.unavailable);
+        if (current()) setPreview(result);
+        return;
+      }
+      const operationId = retained ?? await journal.prepare(body); if (!current()) return;
       const result = kind === "create" ? await api.createPartnerNetwork({ operationId, name, displayName, partnerIds: selected }, { signal: lifetime.current.signal })
         : await api.joinPartnerNetwork({ operationId, invitation, displayName }, { signal: lifetime.current.signal });
       await journal.confirm(body, operationId);
-      if (!lifetime.current.signal.aborted && result.room) onJoined(result.room);
-    } catch (reason) { if (!lifetime.current.signal.aborted) setError(errorText(reason, m)); }
+      if (current() && result.room) onJoined(result.room);
+    } catch (reason) { if (current()) setError(errorText(reason, m)); }
     finally { if (!lifetime.current.signal.aborted) setBusy(false); }
   };
   return <Modal open showClose closeLabel={m.close} title={kind === "create" ? m.create : m.join} onClose={() => { if (!busy) onClose(); }}><form className="partner-group-form" onSubmit={event => { event.preventDefault(); void act(); }}>
     {kind === "create" ? <><label>{m.name}<input autoFocus value={name} maxLength={120} onChange={event => setName(event.target.value)} /></label><fieldset><legend>{m.addPartner}</legend>{partners.filter(partner => partner.lifecycle === "active" && partner.initializationState === "ready").map(partner =>
       <label className="partner-group-check" key={partner.id}><input type="checkbox" checked={selected.includes(partner.id)} disabled={selected.length >= 6 && !selected.includes(partner.id)} onChange={event => setSelected(value => event.target.checked ? [...value, partner.id] : value.filter(id => id !== partner.id))} />{partner.displayName}</label>)}</fieldset></>
-      : <label>{m.invitation}<input autoFocus value={invitation} onChange={event => { setInvitation(event.target.value); setPreview(undefined); }} /></label>}
+      : <label>{m.invitation}<input autoFocus value={invitation} onChange={event => { invitationInput.current = event.target.value; setInvitation(event.target.value); setPreview(undefined); setError(undefined); }} /></label>}
     <label>{m.yourName}<input value={displayName} maxLength={128} onChange={event => setDisplayName(event.target.value)} /></label>
     {preview?.room && <p>{preview.room.name} · {preview.room.members.map(member => member.name).join(" · ")}</p>}
     {error && <p role="alert">{error}</p>}<Button type="submit" tone="primary" disabled={busy || kind === "create" && (!name.trim() || !displayName.trim()) || kind === "join" && (!invitation.trim() || !!preview && !displayName.trim())}>{busy ? <Spinner /> : kind === "create" ? m.create : preview ? m.accept : m.preview}</Button>

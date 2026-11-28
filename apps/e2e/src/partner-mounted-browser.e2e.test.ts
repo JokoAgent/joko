@@ -15,6 +15,8 @@ import {
   CancelPartnerDelegationRequestSchema,
   CancelPartnerDelegationResponseSchema,
   CreatePartnerNetworkRequestSchema,
+  JoinPartnerNetworkResponseSchema,
+  PreviewPartnerNetworkResponseSchema,
   SendPartnerNetworkRequestSchema,
   SendPartnerNetworkResponseSchema,
   OperationState,
@@ -297,6 +299,63 @@ describe("mounted Partner collaboration product chain", () => {
       expect([first, second].map(page => new URL(page.url()).hash)).toEqual([groupHash, groupHash]);
       expect(await rooms()).toEqual([created]);
     } finally { release(); }
+  });
+
+  mountedIt("previews the replacement group invitation before joining it on the other node", { timeout: 120_000 }, async () => {
+    fixture = await RealPiSystemFixture.start({ webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true, taskSharing: true });
+    const host = await RealPiSystemFixture.start({ taskSharing: true });
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    try {
+      const owner = (await host.pair("Group host")).clients.partnerNetwork;
+      const invite = async (name: string) => {
+        const room = required((await owner.createPartnerNetwork({ operationId: crypto.randomUUID(), name, displayName: "Host" })).room, "group");
+        const { invitation } = await owner.invitePartnerNetwork({ roomId: room.id, expectedRevision: room.revision, operationId: crypto.randomUUID() });
+        return { room, invitation };
+      };
+      const first = await invite("First host group"), second = await invite("Replacement host group");
+      browser = await chromium.launch({ executablePath: requiredEnvironment("JOKO_BROWSER_EXECUTABLE"), headless: true });
+      const page = await browser.newPage({ locale: "en-US" });
+      await pairPartnerBrowser(page, fixture, "Group guest");
+      await page.locator(".partner-network-section").getByRole("button", { name: "Enter invitation link…" }).click();
+      const dialog = page.getByRole("dialog", { name: "Enter invitation link…" });
+      const link = dialog.getByLabel("Invitation link", { exact: true });
+      const previewPath = "/joko.v1.PartnerNetworkService/PreviewPartnerNetwork";
+      const previewReply = () => page.waitForResponse(response => response.url().endsWith(previewPath));
+      let received = false;
+      await page.route(`**${previewPath}`, async route => {
+        const response = await route.fetch();
+        received = true;
+        await hold;
+        await route.fulfill({ response });
+      }, { times: 1 });
+      await link.fill(first.invitation);
+      await dialog.getByLabel("Your display name").fill("Visiting member");
+      await dialog.getByRole("button", { name: "Read invitation" }).click();
+      await expect.poll(() => received, { timeout: 15_000 }).toBe(true);
+      await link.fill(second.invitation);
+      const late = previewReply();
+      release();
+      expect(fromBinary(PreviewPartnerNetworkResponseSchema, await (await late).body()).room?.id).toBe(first.room.id);
+      const [replacement] = await Promise.all([previewReply(), dialog.getByRole("button", { name: "Read invitation" }).click()]);
+      expect(fromBinary(PreviewPartnerNetworkResponseSchema, await replacement.body()).room?.id).toBe(second.room.id);
+      await dialog.getByText(second.room.name, { exact: false }).waitFor();
+      const members = async (roomId: string) => (await owner.getPartnerNetwork({ roomId })).snapshot!.room!.members
+        .filter(actor => actor.kind === "human" && actor.state === "joined").map(actor => actor.name);
+      expect(await members(first.room.id)).toEqual(["Host"]);
+      expect(await members(second.room.id)).toEqual(["Host"]);
+      const [accepted] = await Promise.all([page.waitForResponse(response => response.url().endsWith("/JoinPartnerNetwork")),
+        dialog.getByRole("button", { name: "Accept and join" }).click()]);
+      const joined = required(fromBinary(JoinPartnerNetworkResponseSchema, await accepted.body()).room, "joined group");
+      expect(joined.id).toBe(second.room.id);
+      await page.locator(".partner-group-header h1").filter({ hasText: second.room.name }).waitFor();
+      expect(new URL(page.url()).hash).toBe(`#/partners/groups/${encodeURIComponent(`network:${joined.joinId}:${joined.id}`)}`);
+      expect(await members(first.room.id)).toEqual(["Host"]);
+      expect((await members(second.room.id)).sort()).toEqual(["Host", "Visiting member"]);
+    } finally {
+      release();
+      await host.close({ removeRoot: true });
+    }
   });
 
   mountedIt("opens read-only Partner activity before and after reconnect without creating a routine or sending a prompt", { timeout: 120_000 }, async () => {
