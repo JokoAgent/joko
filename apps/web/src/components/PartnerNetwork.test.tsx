@@ -175,6 +175,7 @@ describe("Shared conversation UI receipts", () => {
       snapshot: { room: { ...room, members: [...room.members, member] }, messages: f.rows }
     }));
     f.api.sendPartnerNetwork.mockRejectedValueOnce(new ConnectError("Reply lost", Code.Unavailable));
+    f.api.sendPartnerNetwork.mockRejectedValueOnce(new ConnectError("Retry reply lost", Code.Unavailable));
     const view = await mount(<PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />);
     await act(async () => { button("@all", view.element).click(); await settle(); });
     await act(async () => { button("Send", view.element).click(); await settle(); });
@@ -183,6 +184,14 @@ describe("Shared conversation UI receipts", () => {
     await act(async () => { button("Edit", view.element).click(); await settle(); });
     await act(async () => { button("Send", view.element).click(); await settle(); });
     expect(f.api.sendPartnerNetwork.mock.calls[1]![0]).toEqual(original);
+    await act(async () => { button("Edit", view.element).click(); await settle(); });
+    const composer = view.element.querySelector("textarea")!;
+    await fill(composer, ""); await fill(composer, original.text);
+    await act(async () => { button("Send", view.element).click(); await settle(); });
+    const changed = f.api.sendPartnerNetwork.mock.calls[2]![0];
+    expect(changed).toMatchObject({ text: original.text, mentions: [], mentionAll: true });
+    expect(changed.operationId).not.toBe(original.operationId);
+    expect(button("Retry", view.element)).toBeDefined();
   });
   it("retains the edited send's identity with its draft when returning to the room", async () => {
     const f = setup(); f.api.sendPartnerNetwork.mockRejectedValueOnce(new ConnectError("Reply lost", Code.Unavailable));

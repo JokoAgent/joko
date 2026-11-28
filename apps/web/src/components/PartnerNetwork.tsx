@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { create } from "@bufbuild/protobuf";
+import { create, equals } from "@bufbuild/protobuf";
 import * as wire from "@joko/contracts";
 import { Plus, Users, Settings, Send, Square, ArrowLeft } from "lucide-react";
 import type { AppController } from "../controller.js";
@@ -135,12 +135,13 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
   const [snapshot, setSnapshot] = useState<wire.PartnerNetworkSnapshot>(), [messages, setMessages] = useState<wire.PartnerNetworkMessage[]>([]), [error, setError] = useState<string>(), [busy, setBusy] = useState(false), [settings, setSettings] = useState(false);
   const [draft, setDraft] = useState(initialDraft.text), [mentions, setMentions] = useState<string[]>([...initialDraft.mentions]), [quote, setQuote] = useState(initialDraft.quoteId), [attachments, setAttachments] = useState<wire.PartnerNetworkAttachment[]>([...initialDraft.attachments]), [pending, setPending] = useState<Pending[]>([]), [partners, setPartners] = useState<PartnerProfileView[]>([]);
   const [journalReady, setJournalReady] = useState(false);
+  const [editing, setEditing] = useState(initialDraft.editing);
   const [picked, setPicked] = useState<readonly AttachmentDraft[]>(initialDraft.localAttachments ?? []);
   const [division, setDivision] = useState(initialDraft.forcePlan), [mentionAll, setMentionAll] = useState(initialDraft.mentionAll);
   const tracked = useRef<wire.NetworkTrackedMention[]>([...initialDraft.tracked]), activeThread = useRef(thread), currentDraft = useRef<NetworkComposerDraft>(initialDraft), selection = useRef({ start: 0, end: 0 });
-  currentDraft.current = { text: draft, mentions, mentionAll, forcePlan: division, quoteId: quote, attachments, tracked: tracked.current, localAttachments: picked };
+  currentDraft.current = { text: draft, mentions, mentionAll, forcePlan: division, quoteId: quote, attachments, tracked: tracked.current, localAttachments: picked, editing };
   useEffect(() => { if (activeThread.current === thread) return; writeNetworkDraft(draftScope, activeThread.current, currentDraft.current); const restored = readNetworkDraft(draftScope, thread); activeThread.current = thread;
-    setDraft(restored.text); setMentions([...restored.mentions]); setMentionAll(restored.mentionAll); setDivision(restored.forcePlan); setQuote(restored.quoteId); setAttachments([...restored.attachments]); tracked.current = [...restored.tracked]; setPicked(restored.localAttachments ?? []); attempt.current = undefined; }, [thread]);
+    setDraft(restored.text); setMentions([...restored.mentions]); setMentionAll(restored.mentionAll); setDivision(restored.forcePlan); setQuote(restored.quoteId); setAttachments([...restored.attachments]); tracked.current = [...restored.tracked]; setPicked(restored.localAttachments ?? []); setEditing(restored.editing); attempt.current = undefined; }, [thread]);
   useEffect(() => () => writeNetworkDraft(draftScope, activeThread.current, currentDraft.current), []);
   const [sharing, setSharing] = useState<Record<string, readonly string[]>>({});
   const pickedRef = useRef(picked); pickedRef.current = picked;
@@ -153,17 +154,21 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
     { getItem: key => window.localStorage.getItem(key), setItem: (key, value) => window.localStorage.setItem(key, value) },
     JSON.stringify([profile?.serverId, profile?.id, profile?.deviceId, target.roomId, target.joinId]),
     (key, update) => withLocalReceiptLock(window, key, update)), []);
-  const lifetime = useRef(new AbortController()), list = useRef<HTMLDivElement>(null), requestTail = useRef(Promise.resolve()), draftRef = useRef(draft), attempt = useRef<{ fingerprint: string; id: string } | undefined>(undefined);
-  draftRef.current = draft;
+  const lifetime = useRef(new AbortController()), list = useRef<HTMLDivElement>(null), requestTail = useRef(Promise.resolve()), attempt = useRef<wire.SendPartnerNetworkRequest | undefined>(undefined);
   const room = snapshot?.room, self = room?.members.find(member => member.id === room.selfId), allowed = room?.state === "active" && self?.state === "joined";
   const allowedRef = useRef(allowed); allowedRef.current = allowed;
   const failures = usePartnerNetworkFailures(api, target, messages, () => { setMessages([]); setSnapshot(undefined); setError(m.denied); });
   const mentionMembers = room?.members.filter(actor => actor.id !== room.selfId).map(actor => ({ actorId: actor.id, name: wire.partnerNetworkActorName(actor, room), displayName: actor.name, nickname: actor.nickname })) ?? [];
   const mentionInput = { members: mentionMembers, allLabels: [m.everyone, "all", "everyone", "所有人"], allPartnerLabels: [m.allPartners, "All companions", "所有伙伴"], tracked: tracked.current };
-  const editDraft = (value: string) => { tracked.current = wire.retainNetworkTrackedMentions(draft, value, { ...mentionInput, editStart: selection.current.start, editEnd: selection.current.end }); const resolved = wire.resolveNetworkMentions(value, { ...mentionInput, tracked: tracked.current }); setDraft(value); setMentions(resolved.actorIds); setMentionAll(resolved.all); };
+  const updateText = (value: string) => {
+    const resolved = wire.resolveNetworkMentions(value, { ...mentionInput, tracked: tracked.current });
+    setDraft(value); setMentions(resolved.actorIds); setMentionAll(resolved.all);
+    setEditing(previous => previous?.useOriginalAudience ? { ...previous, useOriginalAudience: false } : previous);
+  };
+  const editDraft = (value: string) => { tracked.current = wire.retainNetworkTrackedMentions(draft, value, { ...mentionInput, editStart: selection.current.start, editEnd: selection.current.end }); updateText(value); };
   const pickMention = (actorId?: string, audience = m.everyone) => { const label = actorId ? mentionMembers.find(member => member.actorId === actorId)?.name : audience; if (!label) return;
     const prefix = draft && !/\s$/u.test(draft) ? `${draft} ` : draft, value = `${prefix}@${label} `;
-    if (actorId) tracked.current.push({ actorId, label, start: prefix.length }); const resolved = wire.resolveNetworkMentions(value, { ...mentionInput, tracked: tracked.current }); setDraft(value); setMentions(resolved.actorIds); setMentionAll(resolved.all); };
+    if (actorId) tracked.current.push({ actorId, label, start: prefix.length }); updateText(value); };
   const planCopy = wire.partnerGroupMessages(controller.state.effectiveLocale), planAttempt = useRef<{ fingerprint: string; request: wire.PlanPartnerNetworkRequest } | undefined>(undefined);
   const actPlan = async (action: string, plan: wire.PartnerNetworkPlan, position = 0, actorId = "") => {
     if (busy || !allowed) return; const fingerprint = JSON.stringify([action, plan.id, plan.revision.toString(), position, actorId]);
@@ -255,7 +260,11 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
   const send = async () => {
     if (!allowed || !journalReady || busy || preparingSend.current || !draft.trim() && !attachments.length) return;
     const source = currentDraft.current;
-    const resolved = wire.resolveNetworkMentions(source.text, mentionInput), targetIds = [...new Set([...source.mentions, ...resolved.actorIds])], all = source.mentionAll || resolved.all;
+    const original = source.editing?.request;
+    const resolved = original && source.editing?.useOriginalAudience
+      ? { actorIds: original.mentions, all: original.mentionAll, allPartners: original.mentionAllPartners }
+      : wire.resolveNetworkMentions(source.text, mentionInput);
+    const targetIds = [...new Set([...source.mentions, ...resolved.actorIds])], all = source.mentionAll || resolved.all;
     if (resolved.allPartners && !room?.allowMentionAllPartners) { setError(m.partnerBroadcastDisabled); return; }
     preparingSend.current = true; setBusy(true);
     try {
@@ -273,10 +282,13 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
         } else sentAttachments.push(attachment);
       }
       assertMediaCurrent();
-      const fingerprint = JSON.stringify([source.text, targetIds, source.quoteId, thread, sentAttachments.map(attachment => [attachment.id, attachment.sizeBytes.toString()]), source.forcePlan, all, resolved.allPartners]);
-      if (attempt.current?.fingerprint !== fingerprint) attempt.current = { fingerprint, id: crypto.randomUUID() };
-      const item: Pending = { request: create(wire.SendPartnerNetworkRequestSchema, { ...target, operationId: attempt.current.id, text: source.text, mentions: targetIds, mentionAll: all,
-        mentionAllPartners: resolved.allPartners, forcePlan: source.forcePlan, quoteId: source.quoteId, threadRootId: thread, attachments: sentAttachments }), createdAt: Date.now(), status: "queued" };
+      const request = create(wire.SendPartnerNetworkRequestSchema, { ...target, text: source.text, mentions: targetIds, mentionAll: all,
+        mentionAllPartners: resolved.allPartners, forcePlan: source.forcePlan, quoteId: source.quoteId, threadRootId: thread, attachments: sentAttachments });
+      const matching = [original, attempt.current].find(previous => previous && equals(wire.SendPartnerNetworkRequestSchema,
+        previous, { ...request, operationId: previous.operationId }));
+      request.operationId = matching?.operationId ?? crypto.randomUUID();
+      attempt.current = request;
+      const item: Pending = { request, createdAt: Date.now(), status: "queued" };
       await journal.prepare(item.request, item.createdAt); assertMediaCurrent();
       for (const attachment of source.attachments) materializedUploads.current.delete(attachment.id);
       setPending(previous => [...previous.filter(old => old.request.operationId !== item.request.operationId), item]);
@@ -286,6 +298,7 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
         && pickedRef.current === source.localAttachments && tracked.current === source.tracked) {
         setDraft(""); setMentions([]); setMentionAll(false); setDivision(false); setQuote(""); setAttachments([]); setPicked([]); tracked.current = [];
       }
+      setEditing(previous => previous?.request === original ? undefined : previous);
       attempt.current = undefined; submit(item);
     } catch (reason) { if (!lifetime.current.signal.aborted) setError(errorText(reason, m)); }
     finally { preparingSend.current = false; if (!lifetime.current.signal.aborted) setBusy(false); }
@@ -359,7 +372,10 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
           <details><summary>{m.reaction}</summary>{["👍", "❤️", "😂", "🎉", "🤔", "🙏"].map(emoji => <Button key={emoji} tone="ghost" disabled={!allowed} onClick={() => { void api.reactPartnerNetwork({ ...target, operationId: crypto.randomUUID(), messageId: message.id, emoji, add: !message.reactions.some(reaction => reaction.emoji === emoji && reaction.actorIds.includes(room!.selfId)) }, { signal: lifetime.current.signal }).then(() => read()).catch(reason => setError(errorText(reason, m))); }}>{emoji}</Button>)}</details>
           {message.reactions.map(reaction => <span className="partner-network-reaction" key={reaction.emoji} aria-label={`${reaction.emoji} ${reaction.actorIds.length <= 3 ? reaction.actorIds.map(id => room?.members.find(member => member.id === id)?.name || "?").join(", ") : reaction.actorIds.length}`}>{reaction.emoji} {reaction.actorIds.length <= 3 ? reaction.actorIds.map(id => <span className="partner-network-initial" key={id} aria-hidden="true">{(room?.members.find(member => member.id === id)?.name || "?").slice(0, 1)}</span>) : reaction.actorIds.length}</span>)}</div>
       </div></article>)}
-      {pending.filter(item => item.request.threadRootId === thread && (!item.messageId || !messages.some(message => message.id === item.messageId))).map(item => <article className="partner-group-message is-user" key={item.request.operationId}><div className="partner-group-message-body"><p>{item.request.text}</p><small>{item.status === "failed" ? m.failed : m.sending}</small>{item.status === "failed" && <div><Button onClick={() => submit(item)}>{m.retry}</Button><Button disabled={!!draft || !!attachments.length} onClick={() => { setDraft(item.request.text); setMentions(item.request.mentions); setMentionAll(item.request.mentionAll); setDivision(item.request.forcePlan); setQuote(item.request.quoteId); setAttachments(item.request.attachments); tracked.current = []; attempt.current = { fingerprint: JSON.stringify([item.request.text, item.request.mentions, item.request.quoteId, thread, item.request.attachments.map(attachment => [attachment.id, attachment.sizeBytes.toString()]), item.request.forcePlan, item.request.mentionAll, item.request.mentionAllPartners]), id: item.request.operationId }; setPending(previous => previous.filter(old => old !== item)); }}>{m.edit}</Button></div>}</div></article>)}
+      {pending.filter(item => item.request.threadRootId === thread && item.request.operationId !== editing?.request.operationId && (!item.messageId || !messages.some(message => message.id === item.messageId))).map(item => <article className="partner-group-message is-user" key={item.request.operationId}><div className="partner-group-message-body"><p>{item.request.text}</p><small>{item.status === "failed" ? m.failed : m.sending}</small>{item.status === "failed" && <div><Button onClick={() => submit(item)}>{m.retry}</Button><Button disabled={!!draft || !!attachments.length} onClick={() => {
+        setDraft(item.request.text); setMentions(item.request.mentions); setMentionAll(item.request.mentionAll); setDivision(item.request.forcePlan); setQuote(item.request.quoteId);
+        setAttachments(item.request.attachments); tracked.current = []; setEditing({ request: item.request, useOriginalAudience: true });
+      }}>{m.edit}</Button></div>}</div></article>)}
       {snapshot?.executions.filter(job => ["queued", "running"].includes(job.status)).map(job => <p role="status" key={job.id}>{room?.members.find(actor => actor.id === job.actorId)?.name} · {job.status === "queued" ? m.waiting : m.replying}</p>)}
       {room && snapshot?.plans.filter(plan => plan.status === "waiting").map(plan => <NetworkPlanFollowUp key={plan.id} plan={plan} room={room} locale={controller.state.effectiveLocale} busy={busy || !allowed} action={(...args) => { void actPlan(...args); }} />)}
       {[...failures.bySource.values()].flat().filter(job => job.kind === "plan-decision").map(job => <Button key={job.id} disabled={!allowed || busy} onClick={() => {

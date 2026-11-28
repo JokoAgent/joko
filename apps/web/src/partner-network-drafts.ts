@@ -1,10 +1,11 @@
-import type { NetworkTrackedMention, PartnerNetworkAttachment } from "@joko/contracts";
+import type { NetworkTrackedMention, PartnerNetworkAttachment, SendPartnerNetworkRequest } from "@joko/contracts";
 import type { AttachmentDraft } from "./model.js";
 
 export interface NetworkComposerDraft {
   readonly text: string; readonly mentions: readonly string[]; readonly mentionAll: boolean; readonly forcePlan: boolean;
   readonly quoteId: string; readonly attachments: readonly PartnerNetworkAttachment[]; readonly tracked: readonly NetworkTrackedMention[];
   readonly localAttachments?: readonly AttachmentDraft[];
+  readonly editing?: { readonly request: SendPartnerNetworkRequest; readonly useOriginalAudience: boolean };
 }
 const drafts = new Map<string, NetworkComposerDraft>();
 const key = (ownerRoom: string, thread: string) => JSON.stringify([ownerRoom, thread]);
