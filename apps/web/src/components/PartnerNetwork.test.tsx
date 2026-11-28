@@ -98,6 +98,30 @@ describe("Shared conversation UI receipts", () => {
     await act(async () => { button("Retry", resumed.element).click(); await settle(); }); expect(f.api.sendPartnerNetwork).toHaveBeenCalledTimes(2);
     expect(f.api.sendPartnerNetwork.mock.calls[1]![0]).toEqual(original); expect(f.rows).toHaveLength(1); expect(resumed.element.textContent).not.toContain("Not sent");
   });
+  it("settles the late retry in both views after another view has displayed the same group message", async () => {
+    const f = setup(), page = () => <PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />;
+    const message = create(wire.PartnerNetworkMessageSchema, { id: "accepted-once", text: "Retry in both views", sequence: 1n });
+    const receipt = create(wire.SendPartnerNetworkResponseSchema, { message });
+    f.api.sendPartnerNetwork.mockImplementationOnce(async () => { f.rows.push(message); throw new ConnectError("Reply lost", Code.Unavailable); });
+    const first = await mount(page()); await fill(first.element.querySelector("textarea")!, message.text);
+    await act(async () => { button("Send", first.element).click(); await settle(); });
+    const second = await mount(page());
+    let release!: (result: wire.SendPartnerNetworkResponse) => void;
+    f.api.sendPartnerNetwork.mockImplementationOnce(() => new Promise(resolve => { release = resolve; })).mockResolvedValueOnce(receipt);
+    await act(async () => { button("Retry", first.element).click(); await settle(); });
+    await act(async () => { button("Retry", second.element).click(); await settle(); });
+    const outbox = Object.keys(localStorage).find(key => key.startsWith("joko.conversation-outbox.v1:"))!;
+    expect(JSON.parse(localStorage.getItem(outbox)!).entries).toEqual([]);
+    await act(async () => { release(receipt); await settle(); });
+    for (const { element } of [first, second]) {
+      expect(element.querySelectorAll('[data-rendered-share-message-id="accepted-once"]')).toHaveLength(1);
+      expect(element.textContent).not.toContain(wire.partnerNetworkMessages("en").failed);
+      expect(element.querySelector('[role="alert"]')).toBeNull();
+    }
+    const original = f.api.sendPartnerNetwork.mock.calls[0]![0];
+    expect(f.api.sendPartnerNetwork.mock.calls.map(([request]) => request)).toEqual([original, original, original]);
+    expect(JSON.parse(localStorage.getItem(outbox)!).entries).toEqual([]);
+  });
   it("resumes an unknown join with the same ID after closing the dialog and keeps invitation secrets out of storage", async () => {
     const f = setup(); f.api.joinPartnerNetwork.mockRejectedValueOnce(new ConnectError("reply lost", Code.Unavailable));
     const invitation = "joko://conversation/join#private-invitation-secret", view = await mount(<PartnerNetworkSection controller={f.controller} partners={[]} />);

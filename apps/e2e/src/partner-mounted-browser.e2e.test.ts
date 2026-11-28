@@ -182,11 +182,12 @@ describe("mounted Partner collaboration product chain", () => {
       await openRoom(second);
       const path = "**/joko.v1.PartnerNetworkService/SendPartnerNetwork";
       const sent: { operationId: string; text: string }[] = [];
-      const observe = (page: Page, drop: boolean) => page.route(path, async route => {
+      const observe = (page: Page, drop: boolean, hold?: () => Promise<void>) => page.route(path, async route => {
         const { operationId, text } = fromBinary(SendPartnerNetworkRequestSchema, route.request().postDataBuffer()!);
         sent.push({ operationId, text });
         const response = await route.fetch();
         expect(response.status()).toBe(200);
+        if (hold) await hold();
         if (drop) await route.abort("failed");
         else await route.fulfill({ response });
       });
@@ -223,18 +224,35 @@ describe("mounted Partner collaboration product chain", () => {
       });
       const ids = originals.map(send => send.operationId);
       expect(await remainingIds()).toEqual(ids);
-      for (const [index, original] of originals.entries()) {
-        const [response] = await Promise.all([
-          reopened.waitForResponse(response => response.url().endsWith("/joko.v1.PartnerNetworkService/SendPartnerNetwork")),
-          retry(reopened, original.text).click()
-        ]);
-        expect(response.ok()).toBe(true);
-        expect(fromBinary(SendPartnerNetworkRequestSchema, response.request().postDataBuffer()!).operationId).toBe(original.operationId);
-        expect(fromBinary(SendPartnerNetworkResponseSchema, await response.body()).message?.id).toBe(committed[index]!.id);
-        await expect.poll(remainingIds, { timeout: 10_000 }).toEqual(ids.slice(index + 1));
-      }
-      expect(sent).toEqual([...originals, ...originals]);
-      expect(await hostedMessages()).toEqual(committed);
+      const peer = await context.newPage();
+      await connectSavedPartnerBrowser(peer, node, device);
+      await openRoom(peer);
+      let received!: () => void, release!: () => void;
+      const peerAccepted = new Promise<void>(resolve => { received = resolve; });
+      const holdReply = new Promise<void>(resolve => { release = resolve; });
+      await observe(peer, false, () => { received(); return holdReply; });
+      const endpoint = "/joko.v1.PartnerNetworkService/SendPartnerNetwork";
+      try {
+        const shared = originals[0]!;
+        await retry(peer, shared.text).click();
+        await peerAccepted;
+        await reopened.bringToFront();
+        for (const [index, original] of originals.entries()) {
+          const [response] = await Promise.all([reopened.waitForResponse(response => response.url().endsWith(endpoint)), retry(reopened, original.text).click()]);
+          expect(response.ok()).toBe(true);
+          expect(fromBinary(SendPartnerNetworkRequestSchema, response.request().postDataBuffer()!).operationId).toBe(original.operationId);
+          expect(fromBinary(SendPartnerNetworkResponseSchema, await response.body()).message?.id).toBe(committed[index]!.id);
+          await expect.poll(remainingIds, { timeout: 10_000 }).toEqual(ids.slice(index + 1));
+        }
+        await peer.bringToFront();
+        const lateReply = peer.waitForResponse(response => response.url().endsWith(endpoint));
+        release();
+        expect(fromBinary(SendPartnerNetworkResponseSchema, await (await lateReply).body()).message?.id).toBe(committed[0]!.id);
+        await peer.locator(".partner-network-main article:not([data-rendered-share-message-id])").filter({ hasText: shared.text }).waitFor({ state: "detached", timeout: 10_000 });
+        expect(await remainingIds()).toEqual([]);
+        expect(sent).toEqual([...originals, shared, ...originals]);
+        expect(await hostedMessages()).toEqual(committed);
+      } finally { release(); }
     });
   }
 
