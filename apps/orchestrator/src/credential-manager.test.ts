@@ -832,6 +832,14 @@ describe("ProviderCatalogManager", () => {
         providers.confirmModelWithdrawals({ backendId: "pi", providerId: "catalog", reviewId, modelIds }, owner, () => undefined);
 
       await refresh(["a", "b", "manual"]);
+      await providers.upsert({ ...entry, modelsEndpoint: "https://catalog.example.test/v1/models?before_id=anchor",
+        provider: { ...entry.provider, id: "reverse-catalog", api: "anthropic-messages" } });
+      const refreshWindow = (ids: string[]) => providers.discoverProviderModels("pi", "reverse-catalog",
+        async () => Response.json({ data: ids.map(id => ({ id })), has_more: false, first_id: ids[0], last_id: ids.at(-1) }),
+        () => undefined, "review-device");
+      await refreshWindow(["a", "b"]);
+      expect((await refreshWindow(["b"])).withdrawalReview).toBeUndefined();
+      expect(providers.get("pi", "reverse-catalog").provider.models.map(model => model.id)).toContain("a");
       expect((await refresh(["b"], { next_cursor: "page-two" })).withdrawalReview).toBeUndefined();
       expect((await refresh(["b", "manual"], { pagination: { totalPages: 2 } })).withdrawalReview).toBeUndefined();
       expect(current()).toEqual(["a", "b", "manual"]);

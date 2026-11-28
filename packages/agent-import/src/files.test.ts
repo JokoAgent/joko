@@ -1,3 +1,4 @@
+import { renameSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -18,6 +19,36 @@ afterEach(async () => {
 });
 
 describe("source file reads", () => {
+  it.each(["truncate", "rewrite", "replace"] as const)("retains a capture issue when an editor performs a %s during a source read", async change => {
+    const root = await fixture();
+    const file = join(root, "USER.md");
+    await writeFile(file, "original");
+    const budget = createImportBudget();
+    const failures: string[] = [];
+    const files = await readImportTree(root, undefined, {
+      ...budget,
+      reserveFile(size) {
+        budget.reserveFile(size);
+        if (change === "truncate") truncateSync(file, 3);
+        if (change === "rewrite") {
+          writeFileSync(file, "modified");
+          utimesSync(file, new Date(0), new Date(0));
+        }
+        if (change === "replace") {
+          writeFileSync(join(root, "replacement"), "modified");
+          renameSync(join(root, "replacement"), file);
+        }
+      }
+    }, (name, error) => {
+      expect(error).toMatchObject({ code: "SOURCE_CHANGED" });
+      failures.push(name);
+    });
+    expect(failures).toEqual(["USER.md"]);
+    expect(files).toEqual([]);
+    const stable = await readImportFile(root, file);
+    expect(stable.bytes.toString()).toBe(change === "truncate" ? "ori" : "modified");
+  });
+
   it("keeps complete original bytes, empty markers and nested hidden documents within one budget", async () => {
     const root = await fixture(); await mkdir(join(root, "memory", ".archive"), { recursive: true });
     const document = Buffer.from("---\ntitle: Notes\n---\n\n  Retain whitespace.\n日本語\n", "utf8");

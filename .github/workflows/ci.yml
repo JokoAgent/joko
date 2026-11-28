@@ -85,6 +85,14 @@ jobs:
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
         run: pnpm --filter @joko/orchestrator exec vitest run --reporter=verbose src/application.test.ts -t 'refreshes a granted workbench project' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/workbench-login.log"
+      - name: Check Partner import files while a source editor is saving
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/agent-import exec vitest run --reporter=verbose src/files.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/import-files.log"
+      - name: Check model catalog pagination and withdrawal reviews
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/orchestrator exec vitest run --reporter=verbose src/provider-model-discovery.test.ts src/credential-manager.test.ts -t 'Anthropic|reviews only models observed' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/catalog-pages.log"
       - name: Check group image saves, routine edits, Telegram offsets and Claude output tails
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
