@@ -209,6 +209,27 @@ it("keeps the finished plans for every visible history page on load and foregrou
   await view.setForeground(false); await view.setForeground(true);
   expect(read.mock.calls.map(([request]) => request.beforeSequence)).toEqual([undefined, 101n]); expectBoth();
 });
+it("displays a slow first room snapshot and resumes polling after it finishes", async () => {
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  try {
+    const f = fixture();
+    const page = create(contract.GetPartnerNetworkResponseSchema, { snapshot: { room: f.room, messages: [
+      { id: "original-message", sequence: 1n, text: "Recovered from a slow connection" }
+    ] } });
+    let release!: (response: contract.GetPartnerNetworkResponse) => void;
+    const read = vi.fn(() => new Promise<contract.GetPartnerNetworkResponse>(resolve => { release = resolve; }));
+    const view = await mount(f, { ...f.api, getPartnerNetwork: read });
+    await click("Shared room");
+    const firstReply = release;
+    await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
+    await act(async () => { firstReply(page); });
+    expect(view.container.textContent).toContain("Recovered from a slow connection");
+    expect(read).toHaveBeenCalledTimes(1);
+    read.mockResolvedValueOnce(page);
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(read).toHaveBeenCalledTimes(2);
+  } finally { vi.useRealTimers(); }
+});
 it("shows read-only plans, welcome events and localized task cards without exposing plan controls", async () => {
   const f = fixture(), plan = create(contract.PartnerNetworkPlanSchema, { id: "plan", roomId: "room", requesterId: "owner", status: "proposed", steps: [{ position: 0, actorId: "partner", task: "Write the result", status: "pending" }] });
   f.room.selfId = "reader"; f.room.members.push(create(contract.PartnerNetworkActorSchema, { id: "reader", kind: "human", role: "member", state: "joined", name: "Reader" }));

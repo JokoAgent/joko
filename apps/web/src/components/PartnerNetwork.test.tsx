@@ -43,6 +43,25 @@ function button(text: string, parent: ParentNode = document.body) { const value 
 async function fill(input: HTMLTextAreaElement | HTMLInputElement, value: string) { await act(async () => { const type = input.tagName === "TEXTAREA" ? HTMLTextAreaElement : HTMLInputElement; Object.getOwnPropertyDescriptor(type.prototype, "value")!.set!.call(input, value); input.dispatchEvent(new Event("input", { bubbles: true })); input.dispatchEvent(new Event("change", { bubbles: true })); await settle(); }); }
 
 describe("Shared conversation UI receipts", () => {
+  it("lets a slow earlier history page reach the conversation across periodic refreshes", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const f = setup();
+      let release!: (response: wire.GetPartnerNetworkResponse) => void;
+      const latest = create(wire.GetPartnerNetworkResponseSchema, { snapshot: { room, hasMore: true,
+        messages: [{ id: "latest", text: "Latest message", sequence: 101n }] } });
+      f.api.getPartnerNetwork.mockImplementation(async input => input.beforeSequence
+        ? new Promise<wire.GetPartnerNetworkResponse>(resolve => { release = resolve; }) : latest);
+      const view = await mount(<PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />);
+      await act(async () => { button("View earlier", view.element).click(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
+      await act(async () => { release(create(wire.GetPartnerNetworkResponseSchema, { snapshot: { room,
+        messages: [{ id: "previous", text: "Earlier message", sequence: 1n }] } })); });
+      expect(view.element.textContent).toContain("Earlier message");
+      expect(view.element.textContent).toContain("Latest message");
+      expect(f.api.getPartnerNetwork.mock.calls.map(([input]) => input.beforeSequence)).toEqual([undefined, 101n]);
+    } finally { vi.useRealTimers(); }
+  });
   it("keeps the main chat mounted beside a resizable thread and advances only that reader at the visible bottom", async () => {
     const f = setup(), root = create(wire.PartnerNetworkMessageSchema, { id: "root", authorId: "partner", authorName: "Nova", text: "Thread source", sequence: 1n,
       threadPreview: { rootId: "root", replyCount: 2n, authorName: "Other", text: "New reply" } });
