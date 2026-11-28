@@ -14,6 +14,7 @@ import {
   GetPartnerDelegationResponseSchema,
   CancelPartnerDelegationRequestSchema,
   CancelPartnerDelegationResponseSchema,
+  SendPartnerNetworkRequestSchema,
   OperationState,
   PermissionMode,
   RunState
@@ -92,11 +93,9 @@ describe("mounted Partner collaboration product chain", () => {
       const manager = await node.pair("Routine inspector");
       const partner = await createPartner(node, manager, "Rowan", "orbit");
       const device = "Routine Web";
-      const challenge = required((await node.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge, "pairing challenge");
       browser = await chromium.launch({ executablePath: requiredEnvironment("JOKO_BROWSER_EXECUTABLE"), headless: true });
       const context = await browser.newContext({ locale: "en-US" });
       const first = await context.newPage(), second = await context.newPage();
-      const directoryUrl = `${node.baseUrl}/#/partners`;
       const openRoutines = async (page: Page) => {
         if (lock === "IndexedDB") await page.evaluate(() => { Object.defineProperty(navigator, "locks", { value: undefined, configurable: true }); });
         else expect(await page.evaluate(() => typeof navigator.locks?.request)).toBe("function");
@@ -107,22 +106,11 @@ describe("mounted Partner collaboration product chain", () => {
         await dialog.getByLabel("Name", { exact: true }).waitFor();
         return dialog;
       };
-      const connectSaved = async (page: Page) => {
-        await page.goto(directoryUrl, { waitUntil: "domcontentloaded" });
-        await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
-        await page.locator(".profile-card", { hasText: device }).getByRole("button", { name: "Connect", exact: true }).click();
-      };
       const receipts = () => first.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith("joko.partner-routine-creation.v1:"))
         .map(key => localStorage.getItem(key)));
-      await first.goto(directoryUrl, { waitUntil: "domcontentloaded" });
-      await first.locator(".connection-tabs > button").nth(2).click();
-      await first.locator("details.device-authorization__manual > summary").click();
-      await first.getByLabel("Joko node address").fill(node.baseUrl);
-      await first.getByLabel("Pairing code").fill(node.pairingCode(challenge.challengeId));
-      await first.getByLabel("Device name").fill(device);
-      await first.locator("form.pair-form button[type=submit]").click();
+      await pairPartnerBrowser(first, node, device);
       const original = await openRoutines(first);
-      await connectSaved(second);
+      await connectSavedPartnerBrowser(second, node, device);
       const other = await openRoutines(second);
       const submitRoutine = async (dialog: typeof original, name: string) => {
         await dialog.getByRole("button", { name: "New routine", exact: true }).click();
@@ -159,12 +147,77 @@ describe("mounted Partner collaboration product chain", () => {
         expect(await receipts()).toEqual(successor);
         await second.close();
         const reopened = await context.newPage();
-        await connectSaved(reopened);
+        await connectSavedPartnerBrowser(reopened, node, device);
         const recovered = await openRoutines(reopened);
         await expect.poll(() => recovered.getByLabel("Name", { exact: true }).inputValue(), { timeout: 10_000 }).toBe("Second routine");
         expect(await receipts()).toEqual([]);
         expect(await storedNames()).toEqual(["First routine", "Second routine"]);
       } finally { release(); }
+    });
+
+    mountedIt(`recovers both committed group sends after two windows lose their replies using ${lock}`, { timeout: 120_000 }, async () => {
+      fixture = await RealPiSystemFixture.start({ webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true });
+      const node = fixture, device = "Group Web";
+      const manager = await node.pair("Group inspector");
+      const room = required((await manager.clients.partnerNetwork.createPartnerNetwork({
+        operationId: "group-window-recovery", name: "Window recovery", displayName: "Group owner"
+      })).room, "the group");
+      browser = await chromium.launch({ executablePath: requiredEnvironment("JOKO_BROWSER_EXECUTABLE"), headless: true });
+      const context = await browser.newContext({ locale: "en-US" });
+      if (lock === "IndexedDB") {
+        await context.addInitScript(() => { Object.defineProperty(navigator, "locks", { value: undefined, configurable: true }); });
+      }
+      const openRoom = async (page: Page) => {
+        await page.bringToFront();
+        await page.locator(".partner-network-section").getByRole("button", { name: /Window recovery/u }).click();
+        await page.locator(".partner-network-main textarea:enabled").waitFor();
+        expect(await page.evaluate(() => typeof navigator.locks?.request)).toBe(lock === "IndexedDB" ? "undefined" : "function");
+      };
+      const first = await context.newPage(), second = await context.newPage();
+      await pairPartnerBrowser(first, node, device);
+      await openRoom(first);
+      await connectSavedPartnerBrowser(second, node, device);
+      await openRoom(second);
+      const path = "**/joko.v1.PartnerNetworkService/SendPartnerNetwork";
+      const sent: { operationId: string; text: string }[] = [];
+      const observe = (page: Page, drop: boolean) => page.route(path, async route => {
+        const { operationId, text } = fromBinary(SendPartnerNetworkRequestSchema, route.request().postDataBuffer()!);
+        sent.push({ operationId, text });
+        const response = await route.fetch();
+        expect(response.status()).toBe(200);
+        if (drop) await route.abort("failed");
+        else await route.fulfill({ response });
+      });
+      const retry = (page: Page, text: string) => page.locator(".partner-network-main article")
+        .filter({ hasText: text }).getByRole("button", { name: "Retry", exact: true });
+      const messages = ["First window message", "Second window message"];
+      for (const [page, text] of [[first, messages[0]!], [second, messages[1]!]] as const) {
+        await observe(page, true);
+        await page.bringToFront();
+        await page.locator(".partner-network-main textarea").fill(text);
+        await page.locator(".partner-network-main").getByRole("button", { name: "Send", exact: true }).click();
+        await retry(page, text).waitFor();
+      }
+      const originals = [...sent];
+      expect(originals.map(send => send.text)).toEqual(messages);
+      expect(new Set(originals.map(send => send.operationId)).size).toBe(2);
+      const hostedMessages = async () => (await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: room.id }))
+        .snapshot!.messages.map(message => message.text).filter(text => messages.includes(text));
+      expect(await hostedMessages()).toEqual(messages);
+      await first.close();
+      await second.close();
+      const reopened = await context.newPage();
+      await observe(reopened, false);
+      await connectSavedPartnerBrowser(reopened, node, device);
+      await openRoom(reopened);
+      for (const text of messages) await retry(reopened, text).waitFor();
+      expect(sent).toEqual(originals);
+      for (const text of messages) {
+        await retry(reopened, text).click();
+        await retry(reopened, text).waitFor({ state: "detached" });
+      }
+      expect(sent).toEqual([...originals, ...originals]);
+      expect(await hostedMessages()).toEqual(messages);
     });
   }
 
@@ -1312,6 +1365,23 @@ function observeBrowserErrors(page: Page): string[] {
 
 async function overflow(page: Page): Promise<number> {
   return page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+}
+
+async function pairPartnerBrowser(page: Page, node: RealPiSystemFixture, device: string): Promise<void> {
+  const challenge = required((await node.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge, "pairing challenge");
+  await page.goto(`${node.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
+  await page.locator(".connection-tabs > button").nth(2).click();
+  await page.locator("details.device-authorization__manual > summary").click();
+  await page.getByLabel("Joko node address").fill(node.baseUrl);
+  await page.getByLabel("Pairing code").fill(node.pairingCode(challenge.challengeId));
+  await page.getByLabel("Device name").fill(device);
+  await page.locator("form.pair-form button[type=submit]").click();
+}
+
+async function connectSavedPartnerBrowser(page: Page, node: RealPiSystemFixture, device: string): Promise<void> {
+  await page.goto(`${node.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+  await page.locator(".profile-card", { hasText: device }).getByRole("button", { name: "Connect", exact: true }).click();
 }
 
 function partnerCard(partnerId: string): string {
