@@ -149,6 +149,37 @@ describe("Shared conversation UI receipts", () => {
     expect(f.api.previewPartnerNetwork).toHaveBeenCalledTimes(1); expect(f.api.joinPartnerNetwork).toHaveBeenCalledTimes(2); expect(f.api.joinPartnerNetwork.mock.calls[1]?.[0]).toEqual(original?.[0]);
     expect(f.controller.navigate).toHaveBeenCalledTimes(1);
   });
+  it("requires the replacement invitation's own preview before joining its group", async () => {
+    const f = setup(), first = "joko://conversation/join#first", second = "joko://conversation/join#second";
+    const replacement = create(wire.PartnerNetworkRoomSchema, { ...room, id: "second-room", name: "Second group", joinId: "guest" });
+    let release!: (response: wire.PreviewPartnerNetworkResponse) => void;
+    f.api.previewPartnerNetwork.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }))
+      .mockResolvedValueOnce(create(wire.PreviewPartnerNetworkResponseSchema, { room: replacement }));
+    f.api.joinPartnerNetwork.mockResolvedValueOnce(create(wire.JoinPartnerNetworkResponseSchema, { room: replacement }));
+    const view = await mount(<PartnerNetworkSection controller={f.controller} partners={[]} />);
+    await act(async () => { button("Enter invitation link…", view.element).click(); });
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
+    const [invitation, name] = dialog.querySelectorAll<HTMLInputElement>("input");
+    await fill(invitation!, first); await fill(name!, "Guest");
+    await act(async () => {
+      button("Read invitation", dialog).click();
+      await vi.waitFor(() => expect(f.api.previewPartnerNetwork).toHaveBeenCalledTimes(1));
+    });
+    await fill(invitation!, second);
+    await act(async () => { release(create(wire.PreviewPartnerNetworkResponseSchema, { room })); });
+    expect(dialog.textContent).not.toContain(room.name);
+    await act(async () => {
+      button("Read invitation", dialog).click();
+      await vi.waitFor(() => expect(f.api.previewPartnerNetwork).toHaveBeenCalledTimes(2));
+    });
+    expect(dialog.textContent).toContain(replacement.name);
+    expect(f.api.joinPartnerNetwork).not.toHaveBeenCalled();
+    await act(async () => {
+      button("Accept and join", dialog).click();
+      await vi.waitFor(() => expect(f.controller.navigate).toHaveBeenCalledWith({ kind: "partners", groupId: "network:guest:second-room" }));
+    });
+    expect(f.api.joinPartnerNetwork).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ invitation: second }), expect.anything());
+  });
   it("withdraws history and the composer on an explicit membership rejection", async () => {
     const f = setup(); f.api.getPartnerNetwork.mockRejectedValue(new ConnectError("revoked", Code.PermissionDenied));
     const view = await mount(<PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />);

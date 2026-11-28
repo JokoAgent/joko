@@ -41,7 +41,11 @@ function fixture() {
   return { room, rows, disk, storage, send, manage, media, api };
 }
 async function mount(f: ReturnType<typeof fixture>, api = f.api) { const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
-  await act(async () => { root.render(<MobilePartnerNetworkScreen api={api} storage={f.storage} colors={colors} locale="en" foreground onBack={() => {}} />); await pause(); }); return { root, container }; }
+  const setForeground = (foreground: boolean) => act(async () => {
+    root.render(<MobilePartnerNetworkScreen api={api} storage={f.storage} colors={colors} locale="en" foreground={foreground} onBack={() => {}} />);
+    await pause();
+  });
+  await setForeground(true); return { root, container, setForeground }; }
 async function pause() { await new Promise(resolve => setTimeout(resolve, 10)); }
 async function click(label: string, parent: ParentNode = document.body) { const target = Array.from(parent.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent === label || button.textContent?.startsWith(label)); expect(target).toBeDefined(); await act(async () => { target!.click(); await pause(); }); }
 async function fill(value: string, label = "Message") { const input = document.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!; await act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value); input.dispatchEvent(new Event("input", { bubbles: true })); await pause(); }); }
@@ -167,6 +171,43 @@ it("retires a pending file open when the user leaves the room", async () => {
     await pause();
   });
   expect(native.openURL).not.toHaveBeenCalled();
+});
+it.each(["inactive", "resumed"])("retires a file open across a temporary interruption even if its reply arrives while %s", async when => {
+  const f = fixture();
+  f.rows.push(create(contract.PartnerNetworkMessageSchema, { id: "document", sequence: 1n,
+    attachments: [{ id: "file", name: "report.txt", mediaType: "text/plain", sizeBytes: 12n }] }));
+  let release!: (response: contract.MediaPartnerNetworkResponse) => void;
+  f.media.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+  const view = await mount(f); await click("Shared room"); await click("report.txt");
+  await view.setForeground(false);
+  if (when === "resumed") await view.setForeground(true);
+  await act(async () => {
+    release(create(contract.MediaPartnerNetworkResponseSchema, { downloadUrl: `${f.room.hostOrigin}/v1/blobs/download/file/old-ticket` }));
+    await pause();
+  });
+  expect(native.openURL).not.toHaveBeenCalled();
+  if (when === "inactive") await view.setForeground(true);
+  await click("report.txt");
+  expect(f.media).toHaveBeenCalledTimes(2);
+  expect(native.openURL).toHaveBeenCalledExactlyOnceWith(`${f.room.hostOrigin}/v1/blobs/download/ticket/short-secret`);
+});
+it("keeps the finished plans for every visible history page on load and foreground refresh", async () => {
+  const f = fixture();
+  const page = (id: string, sequence: bigint, task: string, hasMore: boolean) => create(contract.GetPartnerNetworkResponseSchema, {
+    snapshot: { room: f.room, hasMore, messages: [{ id: `card-${id}`, sequence, kind: "plan", planId: id }],
+      plans: [{ id, roomId: f.room.id, revision: 1n, status: "completed", steps: [{ actorId: "partner", task, status: "completed" }] }] }
+  });
+  const earlier = page("earlier", 1n, "Inspect the old drawing", false), latest = page("latest", 101n, "Check the revised drawing", true);
+  const read = vi.fn(async (request: Partial<contract.GetPartnerNetworkRequest>) => request.beforeSequence === 101n ? earlier : latest);
+  const view = await mount(f, { ...f.api, getPartnerNetwork: read }); await click("Shared room");
+  const expectBoth = () => {
+    expect(view.container.textContent).toContain("Check the revised drawing");
+    expect(view.container.textContent).toContain("Inspect the old drawing");
+  };
+  await click("View earlier"); expectBoth();
+  read.mockClear();
+  await view.setForeground(false); await view.setForeground(true);
+  expect(read.mock.calls.map(([request]) => request.beforeSequence)).toEqual([undefined, 101n]); expectBoth();
 });
 it("shows read-only plans, welcome events and localized task cards without exposing plan controls", async () => {
   const f = fixture(), plan = create(contract.PartnerNetworkPlanSchema, { id: "plan", roomId: "room", requesterId: "owner", status: "proposed", steps: [{ position: 0, actorId: "partner", task: "Write the result", status: "pending" }] });
