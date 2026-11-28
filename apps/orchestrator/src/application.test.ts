@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 
 import { CodexBackendAdapter } from "@joko/adapter-codex";
 import { PiBackendAdapter } from "@joko/adapter-pi";
-import { parseCodeHostPullRequestReference } from "@joko/code-host";
+import { createGhCliTokenSource, GhCliCommandError, parseCodeHostPullRequestReference } from "@joko/code-host";
 import { createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import { OperationService, RemoteHostAuthenticationMode, RemoteHostService, RemoteHostStatus, SshKeyService } from "@joko/contracts";
@@ -25,7 +25,7 @@ import {
   providerUsageMoneyKind
 } from "./application.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
-import type { OrchestratorConfig } from "./config.js";
+import { loadConfig, type OrchestratorConfig } from "./config.js";
 import { MAKER_MEMORY_PROVIDER_ID } from "./maker-memory.js";
 import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { createInternalServer, createPublicServer } from "./server.js";
@@ -395,6 +395,60 @@ describe("Orchestrator application composition", () => {
     expect(classify(false, "api_key")).toBe("reference-value");
     expect(classify(false, "subscription")).toBe("reference-value");
   });
+
+  it("refreshes a granted workbench project immediately after the host GitHub sign-in", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-workbench-login-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true, maxRetries: 3 }));
+    const workspace = join(root, "project");
+    await mkdir(workspace);
+    const git = promisify(execFile);
+    await git("git", ["-C", workspace, "init"]);
+    await git("git", ["-C", workspace, "remote", "add", "origin", "https://github.com/acme/work.git"]);
+    vi.stubEnv("GH_CONFIG_DIR", join(root, "gh"));
+    cleanups.push(async () => { vi.unstubAllEnvs(); });
+    let signedIn = false;
+    const credentials = createGhCliTokenSource({
+      now: () => 1_000,
+      command: async () => {
+        if (!signedIn) throw new GhCliCommandError("notSignedIn");
+        return Buffer.from("workbench-fixture-token\n");
+      },
+      loginCommand: async () => { signedIn = true; }
+    });
+    const originalFetch = globalThis.fetch;
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.origin !== "https://api.github.com") return originalFetch(input, init);
+      if (new Headers(init?.headers).get("authorization") !== "Bearer workbench-fixture-token") return new Response(null, { status: 401 });
+      if (url.pathname === "/user") return Response.json({ login: "reviewer" });
+      const assigned = url.pathname === "/search/issues" && url.searchParams.get("q") === "repo:acme/work is:open is:issue assignee:reviewer";
+      return Response.json({ items: assigned ? [{ number: 7, title: "Assigned work", html_url: "https://github.com/Acme/Work/issues/7" }] : [] });
+    });
+    cleanups.push(async () => { fetch.mockRestore(); });
+    const config = loadConfig({ JOKO_DATA_DIR: join(root, "data"), JOKO_WORKSPACE_ROOT: workspace,
+      JOKO_ALLOW_INSECURE_LOOPBACK: "1", JOKO_LAN_DISCOVERY: "0", JOKO_VOICE_DICTIONARY_LAN_DISCOVERY: "0" });
+    const app = await createOrchestratorApplication(config, { codeHostCredentials: credentials });
+    cleanups.push(() => app.close());
+    const providerId = "workbench-fixture", modelId = "review";
+    await app.providers!.upsert({ backendId: "pi", credentialOrigin: "", displayName: "Workbench fixture", enabled: true,
+      kind: "local_keyless", credentialBindings: {}, supportsLogin: false, supportsLogout: false, supportsRefresh: false,
+      provider: { id: providerId, baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", keyless: true,
+        models: [{ id: modelId, contextWindow: 16_384, maxTokens: 1_024 }] } });
+    await app.refreshPiGeneration!();
+    const partner = await app.partners!.createPartner({ requestId: "workbench-login", expectedDirectoryRevision: app.partners!.directory().state.revision,
+      displayName: "Reviewer", avatar: "orbit", identitySource: "Review the project.", templateId: "general", usesDirectoryDefaults: false,
+      capabilities: { modelChain: [{ backendId: "pi", providerId, modelId, fastMode: false }], permissionMode: "ask", planMode: false } });
+    const workbench = app.partnerWorkbenches!;
+    const initial = await workbench.readState(partner.id);
+    const granted = await workbench.addProject(initial.owner, initial.state.revision, workspace);
+    expect(granted.briefs[0]?.codeHost.unavailable).toBe("no_credential");
+    await app.codeHostCredentials!.signIn(new AbortController().signal, () => {}, () => {});
+    const refreshed = await workbench.readState(partner.id);
+    expect(refreshed.briefs[0]?.codeHost.issues).toMatchObject([{ number: 7, title: "Assigned work" }]);
+    signedIn = false;
+    credentials.invalidate();
+    expect((await workbench.readState(partner.id)).briefs[0]?.codeHost).toMatchObject({ unavailable: "no_credential", issues: [] });
+  }, 60_000);
 
   it("installs the fixed public code-host capability unless composition explicitly overrides it", () => {
     const defaults = composeCodeHostProviders(undefined);

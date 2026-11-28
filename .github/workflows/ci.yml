@@ -81,6 +81,10 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm codegen:check
           pnpm --filter @joko/orchestrator... -r --if-present build
+      - name: Check project briefs after the host GitHub sign-in
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/orchestrator exec vitest run --reporter=verbose src/application.test.ts -t 'refreshes a granted workbench project' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/workbench-login.log"
       - name: Check group image saves, routine edits, Telegram offsets and Claude output tails
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
