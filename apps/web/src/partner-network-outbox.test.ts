@@ -1,4 +1,4 @@
-import { create } from "@bufbuild/protobuf";
+import { create, toJsonString } from "@bufbuild/protobuf";
 import { expect, it, vi } from "vitest";
 import { PartnerNetworkSendJournal, SendPartnerNetworkRequestSchema } from "@joko/contracts";
 
@@ -32,4 +32,33 @@ it("preserves overlapping main and thread sends when either view settles or reop
   await main.displayed(new Set(["main-message"]));
   await thread.prepare(second);
   expect(await open().initialize()).toEqual([{ request: second, createdAt: 20 }]);
+});
+
+it("settles a displayed message only for the matching room and membership", async () => {
+  let disk: string | null = null;
+  const journal = new PartnerNetworkSendJournal({ getItem: () => disk, setItem: (_key, value) => { disk = value; } }, "phone");
+  await journal.initialize();
+  for (const [roomId, joinId] of [["one", "a"], ["two", "b"], ["one", "c"]] as const) {
+    await journal.prepare(create(SendPartnerNetworkRequestSchema, { operationId: joinId, roomId, joinId }));
+    await journal.acknowledge(joinId, "message");
+  }
+  await journal.displayed(new Set(["message"]), { roomId: "one", joinId: "a" });
+  expect(journal.list().map(entry => entry.request.joinId)).toEqual(["b", "c"]);
+});
+
+it("can resolve old v1 entries above the limit before admitting another send", async () => {
+  const request = (index: number) => create(SendPartnerNetworkRequestSchema, { operationId: `send-${index}`, roomId: "room", text: "Pending" });
+  const entries = Array.from({ length: 1001 }, (_, index) => ({
+    request: toJsonString(SendPartnerNetworkRequestSchema, request(index)), createdAt: index
+  }));
+  let disk = JSON.stringify({ format: 1, scope: "owner", entries });
+  const journal = new PartnerNetworkSendJournal({ getItem: () => disk, setItem: (_key, value) => { disk = value; } }, "owner");
+  expect(await journal.initialize()).toHaveLength(1001);
+  await expect(journal.prepare(request(1001))).rejects.toThrow(/full/);
+  await journal.prepare(request(0));
+  await journal.acknowledge("send-0", "first");
+  await journal.acknowledge("send-1", "second");
+  await journal.displayed(new Set(["first", "second"]));
+  await journal.prepare(request(1001));
+  expect(journal.list()).toHaveLength(1000);
 });

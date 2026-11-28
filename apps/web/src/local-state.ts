@@ -2078,7 +2078,7 @@ function extensionSettingsOperationKey(profile: ConnectionProfile, extensionId: 
 }
 
 /** The readwrite transaction holds the origin lock while the localStorage operations settle in microtasks. */
-export async function withRoutineReceiptLock(owner: Window, key: string, update: () => Promise<void>): Promise<void> {
+export async function withLocalReceiptLock(owner: Window, key: string, update: () => Promise<void>): Promise<void> {
   if (owner.navigator.locks) return owner.navigator.locks.request(key, update);
   const database = await openDatabase();
   try {

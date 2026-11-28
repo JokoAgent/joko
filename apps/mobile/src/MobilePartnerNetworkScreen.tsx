@@ -68,7 +68,7 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
       const rows = [...response.snapshot.messages, ...prior.flatMap(page => page.snapshot?.messages ?? [])];
       setSnapshot(create(contract.PartnerNetworkSnapshotSchema, { ...response.snapshot, hasMore: prior.at(-1)?.snapshot?.hasMore ?? response.snapshot.hasMore }));
       setMessages(previous => [...new Map([...older ? previous : [], ...rows].map(row => [row.id, row])).values()].sort((a, b) => a.sequence < b.sequence ? -1 : 1));
-      setError(undefined); await journal?.displayed(new Set(rows.map(row => row.id))); if (!signal.aborted) setRetained(journal?.list() ?? []);
+      setError(undefined); await journal?.displayed(new Set(rows.map(row => row.id)), key); if (!signal.aborted) setRetained(journal?.list() ?? []);
     } catch (reason) { if (!signal.aborted && version === readVersion.current) { setError(failure(reason)); if (reason instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(reason.code)) { setMessages([]); setSnapshot(undefined); } } }
   };
   useEffect(() => { let active = true; setJournalReady(false); void journal?.initialize().then(entries => { if (active) { setRetained(entries); setJournalReady(true); } }).catch(() => { if (active) setError(m.unavailable); });

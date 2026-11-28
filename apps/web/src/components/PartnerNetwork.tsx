@@ -5,6 +5,7 @@ import * as wire from "@joko/contracts";
 import { Plus, Users, Settings, Send, Square, ArrowLeft } from "lucide-react";
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
+import { withLocalReceiptLock } from "../local-state.js";
 import { partnerConversationDragProps } from "../partner-window-navigation.js";
 import type { PartnerNetworkApi } from "../partner-network-api.js";
 import { PartnerNetworkEntryJournal } from "../partner-network-entry-journal.js";
@@ -148,8 +149,10 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
   const previews = useMemo<readonly AttachmentDraft[]>(() => picked.map(item => ({ ...item, kind: item.file.type.startsWith("image/") ? "image" : "file", ...(item.file.type.startsWith("image/") ? { previewUrl: URL.createObjectURL(item.file) } : {}) })), [picked]);
   useEffect(() => () => { for (const item of previews) if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); }, [previews]);
   const profile = controller.state.activeProfile;
-  const journal = useMemo(() => new wire.PartnerNetworkSendJournal({ getItem: key => window.localStorage.getItem(key), setItem: (key, value) => window.localStorage.setItem(key, value) },
-    JSON.stringify([profile?.serverId, profile?.id, profile?.deviceId, target.roomId, target.joinId])), []);
+  const journal = useMemo(() => new wire.PartnerNetworkSendJournal(
+    { getItem: key => window.localStorage.getItem(key), setItem: (key, value) => window.localStorage.setItem(key, value) },
+    JSON.stringify([profile?.serverId, profile?.id, profile?.deviceId, target.roomId, target.joinId]),
+    (key, update) => withLocalReceiptLock(window, key, update)), []);
   const lifetime = useRef(new AbortController()), list = useRef<HTMLDivElement>(null), requestTail = useRef(Promise.resolve()), draftRef = useRef(draft), attempt = useRef<{ fingerprint: string; id: string } | undefined>(undefined);
   draftRef.current = draft;
   const room = snapshot?.room, self = room?.members.find(member => member.id === room.selfId), allowed = room?.state === "active" && self?.state === "joined";

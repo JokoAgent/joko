@@ -1,4 +1,5 @@
 import { create, toJsonString, type MessageInitShape } from "@bufbuild/protobuf";
+import { serializeLocalReceipt } from "./local-receipt-lock.js";
 import {
   RoutineDefinitionSchema, SavePartnerRoutineRequestSchema, RunPartnerRoutineRequestSchema, DeletePartnerRoutineRequestSchema,
   type RoutineDefinition, type PartnerRoutine, type ListPartnerRoutinesResponse, type ListPartnerRoutineRunsResponse,
@@ -74,16 +75,6 @@ export interface RoutineReceiptStorage {
   getItem(key: string): string | null | Promise<string | null>;
   setItem(key: string, value: string): void | Promise<void>;
   removeItem(key: string): void | Promise<void>;
-}
-
-const localReceiptUpdates = new Map<string, Promise<void>>();
-function serializeLocalReceipt(key: string, update: () => Promise<void>): Promise<void> {
-  const previous = localReceiptUpdates.get(key) ?? Promise.resolve();
-  const next = previous.then(update, update);
-  localReceiptUpdates.set(key, next);
-  return next.finally(() => {
-    if (localReceiptUpdates.get(key) === next) localReceiptUpdates.delete(key);
-  });
 }
 
 /** The original request ID is durable before dispatch. All windows serialize changes to the same slot. */

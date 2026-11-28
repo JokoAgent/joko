@@ -5,7 +5,7 @@ import { PartnerNightlyLearningEditor, PartnerRoutineEditor, RoutineCreationRece
   RoutineSessionMode, RoutineModelSchema, decodeModelSpeed, encodeModelSpeed,
   type RoutineDefinition, type RoutineModelChoice, type RoutineTrigger, type RoutineMessages } from "@joko/contracts";
 import type { AppController } from "../controller.js";
-import { withRoutineReceiptLock } from "../local-state.js";
+import { withLocalReceiptLock } from "../local-state.js";
 import { usePartnerDocumentForeground } from "./use-partner-working-status.js";
 import { Button, Modal, CheckboxControl } from "./ui.js";
 import { ModelSpeedControl } from "./ModelSpeedControl.js";
@@ -29,7 +29,7 @@ export function PartnerRoutineDialog({ controller, partnerId, ownerKey, onClose,
       if (ownerWindow === null || ownerWindow.closed) throw new Error("Routine document unavailable.");
       current = new PartnerRoutineEditor(controller.partnerRoutineApi(partnerId, ownerKey),
         new RoutineCreationReceipts(ownerWindow.localStorage, JSON.stringify([profile.serverId, profile.id, profile.deviceId, new URL(profile.origin).href]),
-          (key, update) => withRoutineReceiptLock(ownerWindow, key, update)), partnerId);
+          (key, update) => withLocalReceiptLock(ownerWindow, key, update)), partnerId);
       setBinding({ editor: current, owner, document: ownerDocument }); setFailed(false);
     } catch { setBinding(undefined); setFailed(true); }
     return () => current?.dispose();

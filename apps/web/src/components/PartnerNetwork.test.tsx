@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { webcrypto } from "node:crypto";
+import { locks } from "node:worker_threads";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
@@ -14,7 +15,8 @@ import * as imageAttachments from "../image-attachment.js";
 
 vi.mock("./Timeline.js", () => ({ StreamingMarkdown: ({ text }: { text: string }) => <p>{text}</p> }));
 const roots: Root[] = [];
-beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); vi.stubGlobal("crypto", webcrypto); localStorage.clear(); });
+beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); vi.stubGlobal("crypto", webcrypto); localStorage.clear();
+  Object.defineProperty(navigator, "locks", { configurable: true, value: locks }); });
 afterEach(async () => { await act(async () => { for (const root of roots.splice(0)) root.unmount(); }); document.body.replaceChildren(); localStorage.clear(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 const room = create(wire.PartnerNetworkRoomSchema, { id: "room", name: "Shared room", hostServerId: "authority", hostOrigin: "https://authority.test", revision: 1n, state: "active", selfId: "human", availability: "available", replyMode: "all", speakingMode: "auto",
   members: [{ id: "human", name: "Owner", kind: "human", role: "owner", state: "joined" }, { id: "partner", name: "Nova", kind: "partner", role: "member", state: "joined", ownerId: "human", guestAccess: "chat", accessRevision: 1n }] });
