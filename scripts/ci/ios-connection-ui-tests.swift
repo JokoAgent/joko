@@ -528,7 +528,11 @@ final class JokoConnectionUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["manual.pdf"].firstMatch.exists, "The preview must show the original Workspace file name.")
         XCTAssertEqual(app.buttons.matching(NSPredicate(format: "label == %@", "Fit PDF pages to width")).count, 1)
         screenshot("11-original-workspace-pdf")
-        tap(button("Find in PDF"))
+        // The opener is a native toolbar button. The search form it opens belongs to the PDF WebView.
+        let openFind = app.buttons.matching(NSPredicate(format: "label == %@", "Find in PDF"))
+        XCTAssertEqual(openFind.count, 1)
+        wait(openFind.element, "enabled == true")
+        tap(openFind.element, atCenter: true)
         let findField = app.webViews.descendants(matching: .any).matching(NSPredicate(
             format: "label == %@ AND (elementType == %d OR elementType == %d)", "Find in PDF",
             XCUIElement.ElementType.searchField.rawValue, XCUIElement.ElementType.textField.rawValue)).firstMatch
@@ -538,12 +542,15 @@ final class JokoConnectionUITests: XCTestCase {
         tap(app.webViews.buttons["Find in PDF"].firstMatch, atCenter: true)
         XCTAssertTrue(app.webViews.descendants(matching: .any).matching(NSPredicate(
             format: "label CONTAINS %@", "Matching pages (1)")).firstMatch.waitForExistence(timeout: 10))
+        screenshot("11-pdf-find-result")
         tap(app.webViews.buttons["Close"].firstMatch, atCenter: true)
+        wait(findField, "exists == false")
         let backToFiles = app.buttons["Back to Files"].firstMatch
         XCTAssertTrue(backToFiles.isHittable)
         // The header already has 16 points of padding, and the portrait status bar adds at least 20.
         XCTAssertGreaterThanOrEqual(backToFiles.frame.minY - app.windows.firstMatch.frame.minY, 36,
                                     "The PDF preview header must clear the iPhone status bar.")
+        XCTAssertTrue(word.isHittable)
         let wordCenter = word.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
         wordCenter.press(forDuration: 0.8)
         screenshot("12-pdf-word-held")

@@ -584,7 +584,7 @@ async function runConnectionUiTests(app, metroLocation, expectedSha, expectedHas
   const names = ["01-connection-page", "02-saved-nodes", "03-nearby", sdkRuntime === 'http-connect-native' ? "04-webrtc-unavailable" : "04-webrtc-mode", "04-invalid-address", "05-local-identity-error",
     "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme",
     ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : []),
-    ...(verifyWorkspacePdf ? ["11-original-workspace-pdf", "12-pdf-word-held", "12-native-pdf-selection", "13-pdf-word-pasted"] : [])];
+    ...(verifyWorkspacePdf ? ["11-original-workspace-pdf", "11-pdf-find-result", "12-pdf-word-held", "12-native-pdf-selection", "13-pdf-word-pasted"] : [])];
   const progressNames = new Set([...names, "01-saved-nodes-retapped", "04-https-selected", "04-address-tapped", "04-address-quickpath-dismissed",
     "04-address-typing", "04-address-typed", "04-address-input-restored", "04-address-value-observed",
     "11-pdf-address-and-key-confirmed", "11-pdf-identity-check-tapped", "11-pdf-identity-confirmed", "11-pdf-pairing-available",
