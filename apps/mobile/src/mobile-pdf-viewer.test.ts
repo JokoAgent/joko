@@ -76,7 +76,7 @@ describe("mobile PDF viewer HTML", () => {
     expect(html).toContain("for (var pageNumber = 1; pageNumber <= pageCount; pageNumber += 1)");
     expect(html).toContain("IntersectionObserver");
     expect(html).toContain(`var MAX_RESIDENT = ${mobilePdfViewerLimits.maximumResidentCanvases}`);
-    expect(html).toContain("Fit PDF pages to width");
+    expect(html).toContain("Find in PDF");
     expect(html).not.toContain("http://");
     expect(html).not.toContain("file://");
     const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gu)].map((match) => match[1]!);

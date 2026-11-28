@@ -716,6 +716,15 @@ jobs:
           echo "selected_files=${files[*]}" >> "$GITHUB_OUTPUT"
           pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
 
+      - name: Exercise the offline Mobile PDF reader with the installed browser
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.browser.outcome == 'success' }}
+        shell: bash
+        env:
+          JOKO_BROWSER_EXECUTABLE: ${{ steps.browser.outputs.executable }}
+        run: |
+          test -n "$JOKO_BROWSER_EXECUTABLE"
+          pnpm --filter @joko/mobile exec vitest run --reporter=verbose src/pdfjs-runtime-browser.test.ts src/mobile-pdf-viewer-runtime.test.ts src/MobilePdfViewer.test.tsx src/mobile-pdf-viewer.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/mobile-pdf-reader.log"
+
       - name: Upload the affected Web chain logs
         if: ${{ matrix.workload == 'browser-regressions' && always() }}
         uses: actions/upload-artifact@v4
@@ -727,6 +736,7 @@ jobs:
             ${{ runner.temp }}/joko-ci-logs/browser-transfers.log
             ${{ runner.temp }}/joko-ci-logs/terminal-provider.log
             ${{ runner.temp }}/joko-ci-logs/terminal-web.log
+            ${{ runner.temp }}/joko-ci-logs/mobile-pdf-reader.log
           if-no-files-found: warn
           retention-days: 3
 

@@ -11,7 +11,7 @@ export const mobilePdfViewerLimits = {
   standardFontResourceCount: 16
 } as const;
 
-export type MobilePdfRendererState = "ready" | "receiving" | "document" | "rendering" | "complete" | "error";
+export type MobilePdfRendererState = "ready" | "receiving" | "password" | "document" | "rendering" | "complete" | "error";
 export type MobilePdfViewerState = MobilePdfRendererState | "suspended" | "recovering";
 
 export interface MobilePdfViewerStatus {
@@ -23,6 +23,7 @@ export interface MobilePdfViewerStatus {
   readonly renderedPages: number;
   readonly zoomPercent: number;
   readonly error: string | null;
+  readonly canFind?: boolean;
 }
 
 export interface MobilePdfViewerAck {
@@ -62,7 +63,7 @@ export type MobilePdfViewerCommand =
   | { readonly command: "chunk"; readonly index: number; readonly offset: number; readonly base64: string }
   | { readonly command: "commit" }
   | { readonly command: "dispose" }
-  | { readonly command: "fit" | "zoom-in" | "zoom-out" | "page-previous" | "page-next" };
+  | { readonly command: "fit" | "zoom-in" | "zoom-out" | "page-previous" | "page-next" | "find" };
 
 export function buildMobilePdfViewerCommand(instanceId: string, command: MobilePdfViewerCommand): string {
   const exactInstanceId = viewerInstanceId(instanceId);
@@ -87,7 +88,7 @@ export function buildMobilePdfViewerCommand(instanceId: string, command: MobileP
   }
   if (command.command !== "commit" && command.command !== "dispose" && command.command !== "fit"
     && command.command !== "zoom-in" && command.command !== "zoom-out"
-    && command.command !== "page-previous" && command.command !== "page-next") {
+    && command.command !== "page-previous" && command.command !== "page-next" && command.command !== "find") {
     throw new Error("The PDF viewer command is invalid.");
   }
   return JSON.stringify({ type: "joko-pdf-viewer/command", instanceId: exactInstanceId, command: command.command });
@@ -112,7 +113,8 @@ export function parseMobilePdfViewerMessage(data: string, instanceId: string): M
         ? { type: "joko-pdf-viewer/position", instanceId: exactInstanceId, ...position } : undefined;
     }
     if (value["type"] !== "joko-pdf-viewer/status"
-      || !exactKeys(value, ["type", "instanceId", "state", "pageCount", "currentPage", "renderedPages", "zoomPercent", "error"])
+      || !exactKeys(value, ["type", "instanceId", "state", "pageCount", "currentPage", "renderedPages", "zoomPercent", "error",
+        ...(typeof value["canFind"] === "boolean" ? ["canFind"] : [])])
       || !pdfViewerState(value["state"]) || !safeCount(value["pageCount"], mobilePdfViewerLimits.maximumPageCount)
       || !safeCurrentPage(value["currentPage"], value["pageCount"] as number)
       || !safeCount(value["renderedPages"], value["pageCount"] as number)
@@ -126,7 +128,8 @@ export function parseMobilePdfViewerMessage(data: string, instanceId: string): M
       currentPage: value["currentPage"] as number,
       renderedPages: value["renderedPages"] as number,
       zoomPercent: value["zoomPercent"] as number,
-      error: value["error"]
+      error: value["error"],
+      ...(value["canFind"] === true ? { canFind: true } : {})
     };
   } catch {
     return undefined;
@@ -165,14 +168,8 @@ export function buildMobilePdfViewerHtml({
   const standardFonts = JSON.stringify(runtime.standardFonts);
   const labels = {
     error: mobileMessage(locale, "preview.pdfError"),
-    ready: mobileMessage(locale, "preview.status.pdfReady"),
-    receiving: mobileMessage(locale, "preview.status.receivingPdf"),
-    preparing: mobileMessage(locale, "preview.status.preparingPdf"),
-    pageCount: mobileMessage(locale, "preview.pdfPageCount", { pages: "{pages}" }),
-    allRendered: mobileMessage(locale, "preview.pdfAllRendered", { pages: "{pages}" }),
-    renderedProgress: mobileMessage(locale, "preview.pdfRenderedProgress", {
-      rendered: "{rendered}", pages: "{pages}"
-    }),
+    matches: mobileMessage(locale, "preview.pdfMatches", { pages: "{pages}" }),
+    incorrectPassword: mobileMessage(locale, "preview.pdfIncorrectPassword"),
     renderedPage: mobileMessage(locale, "preview.pdfRenderedPage", { page: "{page}", pages: "{pages}" }),
     page: mobileMessage(locale, "preview.pdfPage", { page: "{page}", pages: "{pages}" }),
     pageLink: mobileMessage(locale, "preview.pdfPageLink"),
@@ -189,12 +186,15 @@ export function buildMobilePdfViewerHtml({
     * { box-sizing: border-box; }
     html, body { background: ${cssColor(background)}; color: ${cssColor(ink)}; height: 100%; margin: 0; width: 100%; }
     body { display: flex; flex-direction: column; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow: hidden; }
-    #toolbar { align-items: center; background: ${cssColor(surface)}; border-bottom: 1px solid ${cssColor(border)}; display: flex; flex: 0 0 auto; gap: 8px; min-height: 48px; padding: 6px 10px; }
-    #status { color: ${cssColor(muted)}; flex: 1; font-size: 13px; line-height: 18px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    form { align-items: center; background: ${cssColor(surface)}; border-bottom: 1px solid ${cssColor(border)}; display: flex; flex-wrap: wrap; gap: 6px; padding: 6px; }
+    [hidden] { display: none !important; }
+    form input { background: ${cssColor(background)}; border: 1px solid ${cssColor(border)}; border-radius: 8px; color: inherit; flex: 1; font: inherit; min-height: 44px; min-width: 7em; padding: 6px; }
+    form output:not(:empty) { flex-basis: 100%; }
     button { background: ${cssColor(background)}; border: 1px solid ${cssColor(border)}; border-radius: 10px; color: ${cssColor(ink)}; font: inherit; font-weight: 650; min-height: 44px; min-width: 44px; padding: 8px 10px; }
     button:focus-visible { outline: 3px solid ${cssColor(accent)}; outline-offset: 1px; }
-    #pages { align-items: center; display: flex; flex: 1 1 auto; flex-direction: column; gap: 16px; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; }
+    #pages { align-items: flex-start; display: flex; flex: 1 1 auto; flex-direction: column; gap: 16px; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; }
     .page { align-items: center; background: ${cssColor(surface)}; border: 1px solid ${cssColor(border)}; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.12); display: flex; flex: 0 0 auto; justify-content: center; min-height: 320px; overflow: hidden; position: relative; width: min(100%, 760px); }
+    .page { margin-inline: auto; }
     .page-label { color: ${cssColor(muted)}; font-size: 13px; left: 12px; pointer-events: none; position: absolute; top: 10px; z-index: 1; }
     .page-content { max-width: 100%; position: relative; -webkit-user-select: none; user-select: none; }
     .page-selection { inset: 0; pointer-events: none; position: absolute; transform-origin: top left; }
@@ -231,12 +231,17 @@ export function buildMobilePdfViewerHtml({
   </style>
 </head>
 <body aria-label="${escapeHtml(exactTitle)}">
-  <div id="toolbar" role="toolbar" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfControls"))}">
-    <span id="status" role="status" aria-live="polite">${escapeHtml(labels.preparing)}</span>
-    <button id="fit" type="button" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfFitLabel"))}">${escapeHtml(mobileMessage(locale, "preview.pdfFit"))}</button>
-    <button id="zoom-out" type="button" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfZoomOut"))}">−</button>
-    <button id="zoom-in" type="button" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfZoomIn"))}">+</button>
-  </div>
+  <form id="find-form" role="search" hidden>
+    <input id="find-text" type="search" autocomplete="off" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfFind"))}" />
+    <button type="submit">${escapeHtml(mobileMessage(locale, "preview.pdfFind"))}</button>
+    <button id="find-close" type="button">${escapeHtml(mobileMessage(locale, "common.close"))}</button>
+    <output id="find-result" aria-live="polite"></output>
+  </form>
+  <form id="password-form" hidden>
+    <input id="password-text" type="password" autocomplete="off" autocapitalize="none" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfPassword"))}" />
+    <button type="submit">${escapeHtml(mobileMessage(locale, "common.open"))}</button>
+    <output id="password-hint" aria-live="polite"></output>
+  </form>
   <main id="pages" aria-label="${escapeHtml(mobileMessage(locale, "preview.pdfPagesOf", { title: exactTitle }))}"></main>
   <script>${runtime.script}</script>
   <script>
@@ -277,7 +282,13 @@ export function buildMobilePdfViewerHtml({
       var fit = ${initialPosition.fitToWidth};
       var lastPosition = '';
       var pages = document.getElementById('pages');
-      var statusNode = document.getElementById('status');
+      var findForm = document.getElementById('find-form');
+      var findText = document.getElementById('find-text');
+      var findResult = document.getElementById('find-result');
+      var passwordForm = document.getElementById('password-form');
+      var passwordText = document.getElementById('password-text');
+      var passwordReply = null;
+      var findGeneration = 0;
       var MAX_BYTES = ${MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES};
       var MAX_CHUNK = ${mobilePdfViewerLimits.maximumChunkBytes};
       var MAX_PAGES = ${mobilePdfViewerLimits.maximumPageCount};
@@ -298,13 +309,6 @@ export function buildMobilePdfViewerHtml({
       }
       function emit(state, error) {
         currentState = state;
-        var label = state === 'ready' ? labels.ready
-          : state === 'receiving' ? labels.receiving
-          : state === 'document' ? text(labels.pageCount, { pages: pageCount })
-          : state === 'complete' ? text(labels.allRendered, { pages: pageCount })
-          : state === 'error' ? cleanError(error)
-          : text(labels.renderedProgress, { rendered: seen.size, pages: pageCount });
-        statusNode.textContent = label;
         var zoomPercent = Math.round(zoom * 100);
         if (currentPage > 0 && state !== 'error') {
           var position = String(currentPage) + ':' + String(zoomPercent) + ':' + String(fit);
@@ -316,7 +320,7 @@ export function buildMobilePdfViewerHtml({
         }
         post({ type: 'joko-pdf-viewer/status', instanceId: instanceId, state: state,
           pageCount: pageCount, currentPage: currentPage, renderedPages: seen.size,
-          zoomPercent: zoomPercent,
+          zoomPercent: zoomPercent, canFind: textSelectionAllowed && pageCount > 0,
           error: state === 'error' ? cleanError(error) : null });
       }
       function ack(command, index) {
@@ -342,7 +346,7 @@ export function buildMobilePdfViewerHtml({
             && value.base64.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value.base64)) return value;
           if ((value.command === 'commit' || value.command === 'dispose' || value.command === 'fit'
             || value.command === 'zoom-in' || value.command === 'zoom-out'
-            || value.command === 'page-previous' || value.command === 'page-next')
+            || value.command === 'page-previous' || value.command === 'page-next' || value.command === 'find')
             && exactKeys(value, ['type','instanceId','command'])) return value;
         } catch (_) {}
         return null;
@@ -477,12 +481,13 @@ export function buildMobilePdfViewerHtml({
           canvas.style.width = String(Math.ceil(viewport.width)) + 'px'; canvas.style.height = String(Math.ceil(viewport.height)) + 'px';
           canvas.setAttribute('aria-label', text(labels.renderedPage, { page: pageNumber, pages: pageCount }));
           var content = document.createElement('div'); content.className = 'page-content'; content.appendChild(canvas);
-          section.style.height = String(Math.ceil(viewport.height)) + 'px'; section.appendChild(content);
+          section.style.width = String(Math.ceil(viewport.width) + 2) + 'px';
+          section.style.height = String(Math.ceil(viewport.height) + 2) + 'px'; section.appendChild(content);
           var context = canvas.getContext('2d', { alpha: false }); if (!context) throw new Error('Canvas rendering is unavailable.');
           var task = page.render({ canvasContext: context, viewport: viewport, transform: dpr === 1 ? null : [dpr,0,0,dpr,0,0] });
           holder.cancel = function () { try { task.cancel(); } catch (_) {} };
           await task.promise; if (disposed || generation !== renderGeneration) return;
-          var drawing = { canvas: canvas, viewport: viewport, view: page.view };
+          var drawing = { canvas: canvas, viewport: viewport, view: page.view, scale: scale };
           rendered.set(pageNumber, drawing); seen.add(pageNumber); touchResident(pageNumber);
           emit(seen.size === pageCount ? 'complete' : 'rendering', null);
           if (textSelectionAllowed) void renderPageText(page, content, viewport).catch(function () {});
@@ -583,11 +588,87 @@ export function buildMobilePdfViewerHtml({
         document.querySelectorAll('.page-content').forEach(removePageContent);
         renderVisiblePages(); emit(seen.size === pageCount ? 'complete' : 'rendering', null);
       }
+      function readingAnchor(target, x, y) {
+        var section = target.closest?.('.page');
+        var number = Number(section?.dataset.page), drawing = rendered.get(number);
+        if (!drawing || !drawing.canvas.isConnected) return null;
+        var rect = drawing.canvas.getBoundingClientRect();
+        if (!rect.width || !rect.height) return null;
+        return { section: section, number: number, scale: drawing.scale, x: x, y: y,
+          rx: Math.max(0, Math.min(1, (x - rect.left) / rect.width)),
+          ry: Math.max(0, Math.min(1, (y - rect.top) / rect.height)) };
+      }
+      function zoomAt(anchor, scale, toFit, x, y) {
+        var request = ++linkRequest;
+        zoom = toFit ? 1 : Math.max(0.5, Math.min(3, Math.round(scale * 100) / 100)); fit = toFit;
+        resetRenderedPages();
+        var generation = renderGeneration;
+        void Promise.resolve(renderPage(anchor.number)).then(function (drawing) {
+          if (disposed || generation !== renderGeneration || request !== linkRequest || !drawing?.canvas.isConnected) return;
+          var rect = drawing.canvas.getBoundingClientRect();
+          pages.scrollTo({ left: pages.scrollLeft + rect.left + anchor.rx * rect.width - x,
+            top: pages.scrollTop + rect.top + anchor.ry * rect.height - y });
+          currentPage = anchor.number; emit(currentState, null);
+        }).catch(function () {});
+      }
+      var pinch = null, tap = null, previousTap = null;
+      function distance(a, b) { return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY); }
+      function cancelGesture() {
+        if (pinch) pinch.anchor.section.style.transform = '';
+        pinch = null; tap = null; previousTap = null;
+      }
+      pages.addEventListener('touchstart', function (event) {
+        if (disposed || !pdfDocument || event.target.closest?.('button, input')) { cancelGesture(); return; }
+        var fingers = event.touches, a = fingers[0], b = fingers[1];
+        if (fingers.length === 2) {
+          var x = (a.clientX + b.clientX) / 2, y = (a.clientY + b.clientY) / 2;
+          var anchor = readingAnchor(event.target, x, y); cancelGesture();
+          if (!anchor) return;
+          pinch = { anchor: anchor, spread: Math.max(1, distance(a, b)), ratio: 1, x: x, y: y };
+          anchor.section.style.transformOrigin = (anchor.rx * 100) + '% ' + (anchor.ry * 100) + '%';
+          event.preventDefault();
+        } else if (fingers.length === 1) tap = { x: a.clientX, y: a.clientY, time: Date.now() };
+        else cancelGesture();
+      }, { passive: false });
+      pages.addEventListener('touchmove', function (event) {
+        var a = event.touches[0], b = event.touches[1];
+        if (pinch && event.touches.length === 2) {
+          event.preventDefault();
+          pinch.ratio = Math.max(0.5 / pinch.anchor.scale, Math.min(3 / pinch.anchor.scale, distance(a, b) / pinch.spread));
+          pinch.x = (a.clientX + b.clientX) / 2; pinch.y = (a.clientY + b.clientY) / 2;
+          pinch.anchor.section.style.transform = 'translate(' + (pinch.x - pinch.anchor.x) + 'px,' +
+            (pinch.y - pinch.anchor.y) + 'px) scale(' + pinch.ratio + ')';
+        } else if (tap && a && Math.hypot(a.clientX - tap.x, a.clientY - tap.y) > 10) tap = null;
+      }, { passive: false });
+      pages.addEventListener('touchend', function (event) {
+        if (pinch && event.touches.length < 2) {
+          var completed = pinch; cancelGesture();
+          if (completed.ratio !== 1) zoomAt(completed.anchor, completed.anchor.scale * completed.ratio, false, completed.x, completed.y);
+          return;
+        }
+        if (!tap || event.touches.length) return;
+        var end = Date.now(), point = tap; tap = null;
+        if (end - point.time > 300 || window.getSelection()?.isCollapsed === false) { previousTap = null; return; }
+        var anchor = readingAnchor(event.target, point.x, point.y);
+        if (!anchor) { previousTap = null; return; }
+        if (previousTap && previousTap.number === anchor.number && end - previousTap.time <= 300 &&
+          Math.hypot(point.x - previousTap.x, point.y - previousTap.y) < 30) {
+          event.preventDefault(); previousTap = null; zoomAt(anchor, anchor.scale * 2, !fit, point.x, point.y);
+        } else previousTap = { number: anchor.number, time: end, x: point.x, y: point.y };
+      }, { passive: false });
+      pages.addEventListener('touchcancel', cancelGesture);
       async function openDocument(data) {
         loadingTask = window.pdfjsLib.getDocument({ data: data, cMapUrl: 'embedded-cmaps/', cMapPacked: true,
           standardFontDataUrl: 'embedded-fonts/', BinaryDataFactory: EmbeddedBinaryDataFactory,
           useWorkerFetch: false, useSystemFonts: false, useWasm: false, isOffscreenCanvasSupported: false,
           isImageDecoderSupported: false, enableHWA: false, canvasMaxAreaInBytes: 33554432 });
+        loadingTask.onPassword = function (update, reason) {
+          if (disposed) return;
+          passwordReply = update;
+          passwordText.value = '';
+          document.getElementById('password-hint').textContent = reason === 2 ? labels.incorrectPassword : '';
+          passwordForm.hidden = false; emit('password', null); passwordText.focus();
+        };
         pdfDocument = await loadingTask.promise;
         if (disposed) return;
         pageCount = pdfDocument.numPages;
@@ -623,6 +704,7 @@ export function buildMobilePdfViewerHtml({
       }
       async function dispose() {
         if (disposed) return; disposed = true; bytes = null; resourceCache = Object.create(null);
+        passwordReply = null; passwordText.value = ''; passwordForm.hidden = true; closeFind(); cancelGesture();
         if (observer) observer.disconnect(); observer = null; renderTasks.forEach(function (task) { task.cancel(); }); renderTasks.clear();
         if (textLayerResizer) textLayerResizer.disconnect();
         document.querySelectorAll('.page-content').forEach(removePageContent);
@@ -634,6 +716,12 @@ export function buildMobilePdfViewerHtml({
         var command = parseCommand(event && event.data); if (!command || disposed) return;
         try {
           if (command.command === 'dispose') { void dispose(); return; }
+          if (command.command === 'find') {
+            if (textSelectionAllowed && pageCount) {
+              if (findForm.hidden) { findForm.hidden = false; findText.focus(); } else closeFind();
+            }
+            return;
+          }
           if (command.command === 'fit') { fit = true; zoom = 1; resetRenderedPages(); return; }
           if (command.command === 'zoom-out') { fit = false; zoom = Math.max(0.5, Math.round((zoom - 0.25) * 100) / 100); resetRenderedPages(); return; }
           if (command.command === 'zoom-in') { fit = false; zoom = Math.min(3, Math.round((zoom + 0.25) * 100) / 100); resetRenderedPages(); return; }
@@ -661,9 +749,42 @@ export function buildMobilePdfViewerHtml({
 
       window.addEventListener('message', handleCommand); document.addEventListener('message', handleCommand);
       pages.addEventListener('scroll', function () { renderVisiblePages(); updateCurrentPage(); }, { passive: true });
-      document.getElementById('fit').addEventListener('click', function () { fit = true; zoom = 1; resetRenderedPages(); });
-      document.getElementById('zoom-out').addEventListener('click', function () { fit = false; zoom = Math.max(0.5, Math.round((zoom - 0.25) * 100) / 100); resetRenderedPages(); });
-      document.getElementById('zoom-in').addEventListener('click', function () { fit = false; zoom = Math.min(3, Math.round((zoom + 0.25) * 100) / 100); resetRenderedPages(); });
+      function closeFind() {
+        findGeneration++; findForm.hidden = true; findText.value = ''; findResult.textContent = '';
+      }
+      async function findPages(query, generation) {
+        var matches = 0, first = 0;
+        for (var number = 1; number <= pageCount; number++) {
+          var page = await pdfDocument.getPage(number);
+          if (generation !== findGeneration) return;
+          var content = await page.getTextContent();
+          if (generation !== findGeneration) return;
+          var body = content.items.map(function (item) { return item.str || ''; }).join(' ');
+          if (body.toLocaleLowerCase().includes(query)) { matches++; if (!first) first = number; }
+        }
+        findResult.textContent = text(labels.matches, { pages: matches });
+        if (first) {
+          linkRequest++; currentPage = first;
+          document.getElementById('page-' + first).scrollIntoView({ block: 'start' }); emit(currentState, null);
+        }
+      }
+      document.getElementById('find-close').addEventListener('click', closeFind);
+      findText.addEventListener('input', function () { findGeneration++; findResult.textContent = ''; });
+      findForm.addEventListener('submit', function (event) {
+        event.preventDefault();
+        if (disposed || findForm.hidden || !textSelectionAllowed) return;
+        var generation = ++findGeneration, query = findText.value.trim().toLocaleLowerCase();
+        findText.blur(); findResult.textContent = '';
+        if (query) void findPages(query, generation).catch(function () {
+          if (generation === findGeneration) findResult.textContent = labels.error;
+        });
+      });
+      passwordForm.addEventListener('submit', function (event) {
+        event.preventDefault();
+        if (disposed || !passwordReply) return;
+        var reply = passwordReply, value = passwordText.value;
+        passwordReply = null; passwordText.value = ''; passwordText.blur(); passwordForm.hidden = true; reply(value);
+      });
       if (!window.pdfjsLib || !window.pdfjsWorker || !window.ReactNativeWebView) { emit('error', 'The offline PDF runtime is unavailable.'); return; }
       emit('ready', null);
     })();
@@ -696,7 +817,7 @@ function assertRuntimeBundle(runtime: MobilePdfJsRuntimeBundle): void {
 }
 
 function pdfViewerState(value: unknown): value is MobilePdfRendererState {
-  return value === "ready" || value === "receiving" || value === "document"
+  return value === "ready" || value === "receiving" || value === "password" || value === "document"
     || value === "rendering" || value === "complete" || value === "error";
 }
 
@@ -708,7 +829,7 @@ function safeCurrentPage(value: unknown, pageCount: number): value is number {
 
 function pdfReadingPosition(page: unknown, zoomPercent: unknown, fitToWidth: unknown): MobilePdfReadingPosition | undefined {
   if (!safeCurrentPage(page, mobilePdfViewerLimits.maximumPageCount) || typeof zoomPercent !== "number" ||
-    !Number.isSafeInteger(zoomPercent) || zoomPercent < 50 || zoomPercent > 300 || zoomPercent % 25 !== 0 ||
+    !Number.isSafeInteger(zoomPercent) || zoomPercent < 50 || zoomPercent > 300 ||
     typeof fitToWidth !== "boolean" || (fitToWidth && zoomPercent !== 100)) return undefined;
   return { page, zoomPercent, fitToWidth };
 }

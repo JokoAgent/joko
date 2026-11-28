@@ -130,6 +130,9 @@ describe("offline mobile PDF viewer runtime", () => {
     expect(getPermissions).toHaveBeenCalledOnce();
     expect(streamTextContent).not.toHaveBeenCalled();
     expect(document.querySelector(".page-text")).toBeNull();
+    dispatch(buildMobilePdfViewerCommand("runtime-1", { command: "find" }));
+    expect(document.querySelector<HTMLFormElement>("#find-form")?.hidden).toBe(true);
+    expect(posted.at(-1)).toMatchObject({ canFind: false });
 
     dispatch(buildMobilePdfViewerCommand("runtime-1", { command: "dispose" }));
     await vi.waitFor(() => expect(document.querySelectorAll(".page")).toHaveLength(0));

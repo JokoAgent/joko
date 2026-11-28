@@ -526,8 +526,19 @@ final class JokoConnectionUITests: XCTestCase {
         XCTAssertTrue(word.isHittable)
         XCTAssertLessThan(word.frame.width, app.windows.firstMatch.frame.width / 2)
         XCTAssertTrue(app.staticTexts["manual.pdf"].firstMatch.exists, "The preview must show the original Workspace file name.")
-        XCTAssertTrue(app.buttons["Fit PDF pages to width"].firstMatch.exists)
+        XCTAssertEqual(app.buttons.matching(NSPredicate(format: "label == %@", "Fit PDF pages to width")).count, 1)
         screenshot("11-original-workspace-pdf")
+        tap(button("Find in PDF"))
+        let findField = app.webViews.descendants(matching: .any).matching(NSPredicate(
+            format: "label == %@ AND (elementType == %d OR elementType == %d)", "Find in PDF",
+            XCUIElement.ElementType.searchField.rawValue, XCUIElement.ElementType.textField.rawValue)).firstMatch
+        XCTAssertTrue(findField.waitForExistence(timeout: 10))
+        findField.tap()
+        findField.typeText("quartz")
+        tap(app.webViews.buttons["Find in PDF"].firstMatch, atCenter: true)
+        XCTAssertTrue(app.webViews.descendants(matching: .any).matching(NSPredicate(
+            format: "label CONTAINS %@", "Matching pages (1)")).firstMatch.waitForExistence(timeout: 10))
+        tap(app.webViews.buttons["Close"].firstMatch, atCenter: true)
         let backToFiles = app.buttons["Back to Files"].firstMatch
         XCTAssertTrue(backToFiles.isHittable)
         // The header already has 16 points of padding, and the portrait status bar adds at least 20.

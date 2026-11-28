@@ -9136,6 +9136,7 @@ function formatMobilePdfViewerStatus(
 ): string {
   if (!status) return mobileMessage(locale, "preview.status.preparingPdf");
   if (status.state === "error") return status.error || mobileMessage(locale, "preview.pdfError");
+  if (status.state === "password") return mobileMessage(locale, "preview.pdfPassword");
   if (status.state === "suspended") return mobileMessage(locale, "preview.status.pdfSuspended");
   if (status.state === "recovering") return mobileMessage(locale, "preview.status.pdfRecovering");
   if (status.state === "ready") return mobileMessage(locale, "preview.status.pdfReady");

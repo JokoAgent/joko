@@ -188,7 +188,7 @@ export function MobilePdfViewer({
       pageCount: 0, currentPage: 0, renderedPages: 0, zoomPercent: 100, error: null });
   }, [instanceId, publishStatus, resource.phase]);
 
-  const sendControl = useCallback((command: "fit" | "zoom-in" | "zoom-out" | "page-previous" | "page-next") => {
+  const sendControl = useCallback((command: "fit" | "zoom-in" | "zoom-out" | "page-previous" | "page-next" | "find") => {
     if (!resource.ownsRenderer(resource.rendererToken)) return;
     webViewRef.current?.postMessage(buildMobilePdfViewerCommand(instanceId, { command }));
   }, [instanceId, resource]);
@@ -216,6 +216,9 @@ export function MobilePdfViewer({
       <MobilePreviewControlButton accessibilityLabel={mobileMessage(locale, "preview.pdfZoomIn")}
         disabled={!controllable || (viewerStatus?.zoomPercent ?? 100) >= 300} ink={ink} label="+"
         onPress={() => sendControl("zoom-in")} surface={background} />
+      <MobilePreviewControlButton accessibilityLabel={mobileMessage(locale, "preview.pdfFind")}
+        disabled={!controllable || !viewerStatus?.canFind} ink={ink} label={mobileMessage(locale, "preview.pdfFindButton")}
+        onPress={() => sendControl("find")} surface={background} />
     </MobilePreviewControlBar>
     {source !== undefined ? <PdfWebView
       key={`${instanceId}:${resource.rendererGeneration}`}
