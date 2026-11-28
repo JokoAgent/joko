@@ -16,6 +16,7 @@ import {
   CancelPartnerDelegationResponseSchema,
   CreatePartnerNetworkRequestSchema,
   SendPartnerNetworkRequestSchema,
+  SendPartnerNetworkResponseSchema,
   OperationState,
   PermissionMode,
   RunState
@@ -203,8 +204,9 @@ describe("mounted Partner collaboration product chain", () => {
       expect(originals.map(send => send.text)).toEqual(messages);
       expect(new Set(originals.map(send => send.operationId)).size).toBe(2);
       const hostedMessages = async () => (await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: room.id }))
-        .snapshot!.messages.map(message => message.text).filter(text => messages.includes(text));
-      expect(await hostedMessages()).toEqual(messages);
+        .snapshot!.messages.filter(message => messages.includes(message.text)).map(({ id, text }) => ({ id, text }));
+      const committed = await hostedMessages();
+      expect(committed.map(message => message.text)).toEqual(messages);
       await first.close();
       await second.close();
       const reopened = await context.newPage();
@@ -213,12 +215,26 @@ describe("mounted Partner collaboration product chain", () => {
       await openRoom(reopened);
       for (const text of messages) await retry(reopened, text).waitFor();
       expect(sent).toEqual(originals);
-      for (const text of messages) {
-        await retry(reopened, text).click();
-        await retry(reopened, text).waitFor({ state: "detached" });
+      const remainingIds = () => reopened.evaluate(() => {
+        const key = Object.keys(localStorage).find(key => key.startsWith("joko.conversation-outbox.v1:"));
+        if (!key) throw new Error("Missing group outbox after reopening the room.");
+        const { entries } = JSON.parse(localStorage.getItem(key)!) as { entries: { request: string }[] };
+        return entries.map(entry => (JSON.parse(entry.request) as { operationId: string }).operationId);
+      });
+      const ids = originals.map(send => send.operationId);
+      expect(await remainingIds()).toEqual(ids);
+      for (const [index, original] of originals.entries()) {
+        const [response] = await Promise.all([
+          reopened.waitForResponse(response => response.url().endsWith("/joko.v1.PartnerNetworkService/SendPartnerNetwork")),
+          retry(reopened, original.text).click()
+        ]);
+        expect(response.ok()).toBe(true);
+        expect(fromBinary(SendPartnerNetworkRequestSchema, response.request().postDataBuffer()!).operationId).toBe(original.operationId);
+        expect(fromBinary(SendPartnerNetworkResponseSchema, await response.body()).message?.id).toBe(committed[index]!.id);
+        await expect.poll(remainingIds, { timeout: 10_000 }).toEqual(ids.slice(index + 1));
       }
       expect(sent).toEqual([...originals, ...originals]);
-      expect(await hostedMessages()).toEqual(messages);
+      expect(await hostedMessages()).toEqual(committed);
     });
   }
 
@@ -252,12 +268,16 @@ describe("mounted Partner collaboration product chain", () => {
     try {
       await submit(first);
       await expect.poll(rooms).toHaveLength(1);
+      const [created] = await rooms();
       await submit(second);
       await second.locator(".partner-group-header h1").filter({ hasText: name }).waitFor();
       release();
+      await first.bringToFront();
       await first.locator(".partner-group-header h1").filter({ hasText: name }).waitFor();
       expect(ids).toEqual([expect.any(String), ids[0]]);
-      expect(await rooms()).toHaveLength(1);
+      const groupHash = `#/partners/groups/${encodeURIComponent(`network:host:${created}`)}`;
+      expect([first, second].map(page => new URL(page.url()).hash)).toEqual([groupHash, groupHash]);
+      expect(await rooms()).toEqual([created]);
     } finally { release(); }
   });
 
