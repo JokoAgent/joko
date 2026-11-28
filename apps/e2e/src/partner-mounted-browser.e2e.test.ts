@@ -248,7 +248,7 @@ describe("mounted Partner collaboration product chain", () => {
         const lateReply = peer.waitForResponse(response => response.url().endsWith(endpoint));
         release();
         expect(fromBinary(SendPartnerNetworkResponseSchema, await (await lateReply).body()).message?.id).toBe(committed[0]!.id);
-        await peer.locator(".partner-network-main article:not([data-rendered-share-message-id])").filter({ hasText: shared.text }).waitFor({ state: "detached", timeout: 10_000 });
+        await expect.poll(() => peer.locator(".partner-network-main article:not([data-rendered-share-message-id])").count(), { timeout: 10_000 }).toBe(0);
         expect(await remainingIds()).toEqual([]);
         expect(sent).toEqual([...originals, shared, ...originals]);
         expect(await hostedMessages()).toEqual(committed);

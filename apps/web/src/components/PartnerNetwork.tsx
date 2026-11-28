@@ -201,7 +201,8 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
       setSnapshot(create(wire.PartnerNetworkSnapshotSchema, { ...result.snapshot, hasMore, plans }));
       setMessages(previous => [...new Map([...older ? previous : [], ...readMessages].map(message => [message.id, message])).values()].sort((a, b) => a.sequence < b.sequence ? -1 : 1)); setError(undefined);
       const ids = new Set(readMessages.map(message => message.id)); await journal.displayed(ids); if (signal.aborted) return;
-      setPending(previous => previous.filter(item => !item.messageId || !ids.has(item.messageId)));
+      setPending(previous => previous.filter(item => (!item.messageId || !ids.has(item.messageId)) &&
+        (item.status !== "failed" || journal.has(item.request.operationId))));
     } catch (reason) { if (!signal.aborted && requestVersion === readVersion.current) { setError(errorText(reason, m)); if (reason instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(reason.code)) { setMessages([]); setSnapshot(undefined); } } }
   };
   useEffect(() => { const signal = lifetime.current.signal; void controller.listPartners(undefined, signal).then(result => { if (!signal.aborted) setPartners([...result.partners]); }).catch(() => {});

@@ -34,6 +34,25 @@ it("preserves overlapping main and thread sends when either view settles or reop
   expect(await open().initialize()).toEqual([{ request: second, createdAt: 20 }]);
 });
 
+it("refreshes a peer's settlement without reinserting its receipt or discarding an unrelated pending message", async () => {
+  let disk: string | null = null;
+  const storage = { getItem: () => disk, setItem: vi.fn((_key: string, value: string) => { disk = value; }) };
+  const first = new PartnerNetworkSendJournal(storage, "room"), peer = new PartnerNetworkSendJournal(storage, "room");
+  const sent = create(SendPartnerNetworkRequestSchema, { operationId: "sent", roomId: "room", text: "Accepted" });
+  const other = create(SendPartnerNetworkRequestSchema, { operationId: "other", roomId: "room", text: "Unconfirmed" });
+  await first.initialize(); await first.prepare(sent); await first.prepare(other);
+  await peer.initialize();
+  await first.acknowledge(sent.operationId, "message");
+  await expect(first.acknowledge(sent.operationId, "different")).rejects.toThrow("identity");
+  await first.displayed(new Set(["message"]));
+  storage.setItem.mockClear();
+  await peer.displayed(new Set(["message"]));
+  expect(peer.list().map(entry => entry.request)).toEqual([other]);
+  await peer.acknowledge(sent.operationId, "message");
+  expect(storage.setItem).not.toHaveBeenCalled();
+  expect(peer.list().map(entry => entry.request)).toEqual([other]);
+});
+
 it("settles a displayed message only for the matching room and membership", async () => {
   let disk: string | null = null;
   const journal = new PartnerNetworkSendJournal({ getItem: () => disk, setItem: (_key, value) => { disk = value; } }, "phone");

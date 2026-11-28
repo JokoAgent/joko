@@ -57,6 +57,7 @@ export class PartnerNetworkSendJournal {
     return [...this.#entries.values()].map(entry => ({ request: fromJsonString(SendPartnerNetworkRequestSchema, entry.request), createdAt: entry.createdAt,
       ...(entry.messageId ? { messageId: entry.messageId } : {}) }));
   }
+  has(operationId: string): boolean { return this.#entries.has(operationId); }
   async prepare(request: SendPartnerNetworkRequest, createdAt = Date.now()): Promise<void> {
     if (!this.#loaded) throw new Error("Read the original conversation outbox before sending.");
     const id = request.operationId, value = toJsonString(SendPartnerNetworkRequestSchema, request);
@@ -75,15 +76,18 @@ export class PartnerNetworkSendJournal {
     if (!this.#loaded) await this.initialize();
     await this.#update(entries => {
       const previous = entries.get(operationId);
-      if (!previous || !validId.test(messageId) || previous.messageId && previous.messageId !== messageId) throw new Error("The send receipt changed identity.");
-      if (previous.messageId === messageId) return false;
+      if (!validId.test(operationId) || !validId.test(messageId) || previous?.messageId && previous.messageId !== messageId) throw new Error("The send receipt changed identity.");
+      // A peer may already have displayed this host receipt and removed its pending entry.
+      if (!previous || previous.messageId === messageId) return false;
       entries.set(operationId, { ...previous, messageId });
       return true;
     });
   }
   async displayed(messageIds: ReadonlySet<string>, room?: Pick<SendPartnerNetworkRequest, "roomId" | "joinId">): Promise<void> {
     if (!this.#loaded) await this.initialize();
-    if (!messageIds.size || ![...this.#entries.values()].some(entry => entry.messageId && messageIds.has(entry.messageId))) return;
+    if (!this.#entries.size) return;
+    const hasReceipt = [...this.#entries.values()].some(entry => entry.messageId && messageIds.has(entry.messageId));
+    if (!hasReceipt && await this.storage.getItem(this.#key) === this.#lastRead) return;
     await this.#update(entries => {
       let changed = false;
       for (const [id, entry] of entries) {
