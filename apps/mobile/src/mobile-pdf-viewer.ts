@@ -282,6 +282,7 @@ export function buildMobilePdfViewerHtml({
       var fit = ${initialPosition.fitToWidth};
       var lastPosition = '';
       var pages = document.getElementById('pages');
+      var pageAreaWidth = 0;
       var findForm = document.getElementById('find-form');
       var findText = document.getElementById('find-text');
       var findResult = document.getElementById('find-result');
@@ -590,6 +591,12 @@ export function buildMobilePdfViewerHtml({
         document.querySelectorAll('.page').forEach(function (section) { section.style.removeProperty('width'); });
         renderVisiblePages(); emit(seen.size === pageCount ? 'complete' : 'rendering', null);
       }
+      function refitOnResize() {
+        var width = pages.clientWidth;
+        if (!width || width === pageAreaWidth) return;
+        pageAreaWidth = width;
+        if (fit) resetRenderedPages();
+      }
       function readingAnchor(target, x, y) {
         var section = target.closest?.('.page');
         var number = Number(section?.dataset.page), drawing = rendered.get(number);
@@ -688,6 +695,8 @@ export function buildMobilePdfViewerHtml({
         }
         currentPage = Math.min(${initialPosition.page}, pageCount);
         pages.replaceChildren(fragment);
+        pageAreaWidth = pages.clientWidth;
+        window.addEventListener('resize', refitOnResize);
         if (currentPage > 1) document.getElementById('page-' + String(currentPage))?.scrollIntoView({ block: 'start' });
         emit('document', null);
         if (typeof IntersectionObserver === 'function') {
@@ -706,6 +715,7 @@ export function buildMobilePdfViewerHtml({
       }
       async function dispose() {
         if (disposed) return; disposed = true; bytes = null; resourceCache = Object.create(null);
+        window.removeEventListener('resize', refitOnResize);
         passwordReply = null; passwordText.value = ''; passwordForm.hidden = true; closeFind(); cancelGesture();
         if (observer) observer.disconnect(); observer = null; renderTasks.forEach(function (task) { task.cancel(); }); renderTasks.clear();
         if (textLayerResizer) textLayerResizer.disconnect();
