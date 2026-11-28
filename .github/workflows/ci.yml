@@ -88,7 +88,7 @@ jobs:
       - name: Check conversation receipts, room changes and mobile schedule edits
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
-        run: pnpm --filter @joko/web --filter @joko/mobile -r --no-bail exec vitest run --reporter=verbose partner-network-outbox.test.ts PartnerNetwork.test.tsx MobilePartnerNetworkScreen.test.tsx mobile-automation-authoring.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/conversation-and-schedule.log"
+        run: pnpm --filter @joko/web --filter @joko/mobile -r --no-bail exec vitest run --reporter=verbose partner-network-outbox.test.ts partner-network-entry-journal.test.ts PartnerNetwork.test.tsx MobilePartnerNetworkScreen.test.tsx mobile-automation-authoring.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/conversation-and-schedule.log"
       - name: Check Partner import files while a source editor is saving
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash

@@ -14,6 +14,7 @@ import {
   GetPartnerDelegationResponseSchema,
   CancelPartnerDelegationRequestSchema,
   CancelPartnerDelegationResponseSchema,
+  CreatePartnerNetworkRequestSchema,
   SendPartnerNetworkRequestSchema,
   OperationState,
   PermissionMode,
@@ -220,6 +221,45 @@ describe("mounted Partner collaboration product chain", () => {
       expect(await hostedMessages()).toEqual(messages);
     });
   }
+
+  mountedIt("opens the same group in both windows when its creation confirmations arrive in reverse order", { timeout: 120_000 }, async () => {
+    fixture = await RealPiSystemFixture.start({ webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true });
+    const node = fixture, device = "Group Web", name = "Overlapping group creation";
+    const manager = await node.pair("Group inspector");
+    browser = await chromium.launch({ executablePath: requiredEnvironment("JOKO_BROWSER_EXECUTABLE"), headless: true });
+    const context = await browser.newContext({ locale: "en-US" }), first = await context.newPage(), second = await context.newPage();
+    await pairPartnerBrowser(first, node, device);
+    await first.locator(".partner-network-section").waitFor();
+    await connectSavedPartnerBrowser(second, node, device);
+    const submit = async (page: Page) => {
+      await page.bringToFront();
+      await page.locator(".partner-network-section").getByRole("button", { name: "Start a group", exact: true }).click();
+      const dialog = page.getByRole("dialog", { name: "Start a group", exact: true });
+      await dialog.getByLabel("Group name", { exact: true }).fill(name);
+      await dialog.getByLabel("Your display name", { exact: true }).fill("Group owner");
+      await dialog.getByRole("button", { name: "Start a group", exact: true }).click();
+    };
+    const path = "**/joko.v1.PartnerNetworkService/CreatePartnerNetwork", ids: string[] = [];
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    for (const page of [first, second]) await page.route(path, async route => {
+      ids.push(fromBinary(CreatePartnerNetworkRequestSchema, route.request().postDataBuffer()!).operationId);
+      const response = await route.fetch();
+      if (page === first) await hold;
+      await route.fulfill({ response });
+    });
+    const rooms = async () => (await manager.clients.partnerNetwork.listPartnerNetwork({})).rooms.map(room => room.id);
+    try {
+      await submit(first);
+      await expect.poll(rooms).toHaveLength(1);
+      await submit(second);
+      await second.locator(".partner-group-header h1").filter({ hasText: name }).waitFor();
+      release();
+      await first.locator(".partner-group-header h1").filter({ hasText: name }).waitFor();
+      expect(ids).toEqual([expect.any(String), ids[0]]);
+      expect(await rooms()).toHaveLength(1);
+    } finally { release(); }
+  });
 
   mountedIt("opens read-only Partner activity before and after reconnect without creating a routine or sending a prompt", { timeout: 120_000 }, async () => {
     fixture = await RealPiSystemFixture.start({
