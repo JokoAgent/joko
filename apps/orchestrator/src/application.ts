@@ -828,6 +828,7 @@ export async function createOrchestratorApplication(
       { store, hostedAgentSources, providerGroups }, backendId, providerId, modelId)
   });
   const codeHostCredentials = dependencies.codeHostCredentials ?? (dependencies.codeHostProviders === undefined ? createGhCliTokenSource() : undefined);
+  const projectCodeHost = new CodeHostProjectProvider(codeHostCredentials && { credentials: codeHostCredentials });
   const codeHostProviders = composeCodeHostProviders(
     dependencies.codeHostProviders,
     new OperationalCodeHostSessionAuthorization(store),
@@ -984,7 +985,7 @@ export async function createOrchestratorApplication(
     iceConfiguration: serverAccessMedia.ice
   });
   const remoteExecution = new RemoteExecutionRouter({ hosts: remoteHosts, peers: devicePeers });
-  const partnerHomeProjects = new PartnerHomeProjects({ execution: remoteExecution, home: targetId => partnerHomeRuntime?.executionHome(targetId), codeHost: new CodeHostProjectProvider() });
+  const partnerHomeProjects = new PartnerHomeProjects({ execution: remoteExecution, home: targetId => partnerHomeRuntime?.executionHome(targetId), codeHost: projectCodeHost });
   const partnerWorkbenchStore = new PartnerWorkbenchStore(join(config.dataDirectory, "partner-homes"));
   const partnerHomeWorkbench = new PartnerHomeWorkbench(store, partnerWorkbenchStore);
   const remotePiProcesses = new RemotePiProcessFactory({
@@ -2543,8 +2544,8 @@ export async function createOrchestratorApplication(
     workbenches: partnerWorkbenchStore, managedDataDirectory: config.dataDirectory,
     remoteProjects: partnerHomeProjects, homeTransit: partnerHomeWorkbench, homeChanging: partnerId => partnerHomeStorage.changing(partnerId),
     homeLocation: partnerId => partnerHomeRuntime ? partnerHomeStorage.current(partnerId, partnerHomeRuntime.local).location : undefined,
-    briefs: new PartnerWorkbenchBriefReader(new CodeHostProjectProvider()), sessionTasks: () => partnerSessionTasks, routines: () => partnerRoutines,
-    pullRequestProviders: (authorization) => composeCodeHostProviders(dependencies.codeHostProviders, authorization) });
+    briefs: new PartnerWorkbenchBriefReader(projectCodeHost), sessionTasks: () => partnerSessionTasks, routines: () => partnerRoutines,
+    pullRequestProviders: (authorization) => composeCodeHostProviders(dependencies.codeHostProviders, authorization, codeHostCredentials) });
   const partnerTaskGroupPublisher = new PartnerSessionTaskGroupPublisher(store, {
     capture: sessionId => partnerNetwork?.ownerTaskScope(sessionId), homeServerId: () => serverId, locale: () => persistedLocale(store),
     publish: async (origin, request, signal) => {
