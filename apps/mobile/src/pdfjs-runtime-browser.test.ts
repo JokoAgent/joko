@@ -117,6 +117,21 @@ describe("bundled mobile pdf.js browser runtime", () => {
         await page.touchscreen.tap(x, y); await page.touchscreen.tap(x, y);
         await expect.poll(async () => Math.abs(((await canvas.boundingBox())?.width ?? 0) - initial.width)).toBeLessThan(2);
         await input.detach();
+      } else {
+        const canvas = page.locator("#page-1 canvas");
+        const canvasSize = () => canvas.evaluate((element: HTMLCanvasElement) => ({
+          display: element.clientWidth, bitmap: element.width
+        }));
+        const portrait = page.viewportSize()!;
+        const fitted = await canvasSize();
+        const widthChange = portrait.height - portrait.width;
+        const pixelRatio = await page.evaluate(() => window.devicePixelRatio);
+        await page.setViewportSize({ width: portrait.height, height: portrait.width });
+        await expect.poll(canvasSize).toEqual({
+          display: fitted.display + widthChange, bitmap: fitted.bitmap + widthChange * pixelRatio
+        });
+        await page.setViewportSize(portrait);
+        await expect.poll(canvasSize).toEqual(fitted);
       }
       const quartz = await text.evaluate((element) => {
         const word = document.createRange();
