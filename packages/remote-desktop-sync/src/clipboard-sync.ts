@@ -59,8 +59,8 @@ export class ClipboardSync {
   private check(): void {
     if (!this.deps.current()) throw new ClipboardSyncError("expired");
   }
-  private validVersion(version: string): string {
-    if (typeof version !== "string" || !/^(?:[0-9]{1,128}|[0-9a-f]{64})$/u.test(version)) throw new ClipboardSyncError("unsupported");
+  private validVersion(version: string, failure: "unsupported" | "outcome-unknown" = "unsupported"): string {
+    if (typeof version !== "string" || !/^(?:[0-9]{1,128}|[0-9a-f]{64})$/u.test(version)) throw new ClipboardSyncError(failure);
     return version;
   }
   private async remoteVersion(): Promise<string> {
@@ -117,15 +117,30 @@ export class ClipboardSync {
       return { json, digest };
     } finally { if (id) void this.cancel(id); }
   }
+  private async confirmRemoteWrite(receipt: Promise<string>): Promise<string> {
+    try {
+      const version = await receipt;
+      this.check();
+      return this.validVersion(version, "outcome-unknown");
+    } catch (error) {
+      if (this.deps.current() && error instanceof ClipboardSyncError &&
+        error.reason !== "unknown" && error.reason !== "outcome-unknown") throw error;
+      // The same baseline can outlive this tick or lease. Re-read both sides
+      // before propagating changes if the previous paste may have happened.
+      Object.assign(this.baseline, { local: "", remote: "", localDigest: undefined, remoteDigest: undefined });
+      this.check();
+      throw new ClipboardSyncError("outcome-unknown");
+    }
+  }
   private async writeRemote(json: string, local: string, remote: string): Promise<string> {
     let id: string | undefined;
     try {
       this.check();
-      let version: string;
+      let receipt: Promise<string>;
       if (this.deps.inline && json.length <= CLIPBOARD_SYNC_CHUNK_CHARS) {
         if ((await this.deps.localVersion()) !== local) throw new ClipboardSyncError("changed");
         this.check();
-        version = await this.deps.remote.paste(json, remote);
+        receipt = this.deps.remote.paste(json, remote);
       } else {
         id = await this.deps.remote.begin(json.length, remote);
         this.check();
@@ -138,10 +153,9 @@ export class ClipboardSync {
         }
         if ((await this.deps.localVersion()) !== local) throw new ClipboardSyncError("changed");
         this.check();
-        version = await this.deps.remote.commit(id);
+        receipt = this.deps.remote.commit(id);
       }
-      this.check();
-      return this.validVersion(version);
+      return await this.confirmRemoteWrite(receipt);
     } finally { if (id) void this.cancel(id); }
   }
 

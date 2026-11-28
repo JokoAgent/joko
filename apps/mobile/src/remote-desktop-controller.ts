@@ -3823,13 +3823,11 @@ export class MobileRemoteDesktopController {
             value: create(RemoteDesktopClipboardContentWriteActionSchema, { transferId, offset, data }) }); },
           commit: async transferId => {
             const result = await content({ case: "commit", value: create(RemoteDesktopClipboardContentCommitActionSchema, { transferId }) });
-            if (result.version === undefined) throw new ClipboardSyncError("unsupported");
-            return result.version;
+            return result.version ?? "";
           },
           paste: async (data, version) => {
             const result = await content({ case: "paste", value: create(RemoteDesktopClipboardContentPasteActionSchema, { data }) }, version);
-            if (result.version === undefined) throw new ClipboardSyncError("unsupported");
-            return result.version;
+            return result.version ?? "";
           },
           cancel: async transferId => { await content({ case: "cancel", value: create(RemoteDesktopClipboardContentCancelActionSchema, { transferId }) }); }
         },
@@ -4062,6 +4060,8 @@ function mobileClipboardSyncError(error: unknown): ClipboardSyncError {
   }
   if (error instanceof MobileRemoteDesktopAuthorityError) return new ClipboardSyncError("expired");
   const detail = remoteDesktopFailure(error), reason = detail?.reason;
+  if (error instanceof ConnectError && (error.code === Code.PermissionDenied || error.code === Code.Unauthenticated) &&
+    (reason === undefined || reason === RemoteDesktopFailureReason.UNSPECIFIED)) return new ClipboardSyncError("permission");
   if (error instanceof ConnectError && error.code === Code.Aborted && reason === RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE && detail?.retryable === false) {
     return new ClipboardSyncError("outcome-unknown");
   }

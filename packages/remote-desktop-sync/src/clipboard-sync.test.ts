@@ -173,7 +173,7 @@ describe("clipboard sync", () => {
     f.retire(); await f.sync.tick();
     expect(f.remote.paste).toHaveBeenCalledTimes(1);
     complete("2"); await rejected;
-    expect(f.baseline.local).toBe("1");
+    expect(f.baseline).toMatchObject({ local: "", remote: "" });
   });
 
   it("transfers bounded Unicode chunks and never replays a consumed commit after an unknown reply", async () => {
@@ -205,7 +205,9 @@ describe("clipboard sync", () => {
     (inline ? f.remote.paste : f.remote.commit).mockResolvedValueOnce("");
     await expect(f.sync.tick()).rejects.toMatchObject({ reason: "outcome-unknown" });
     expect(f.transfers.size).toBe(0);
-    expect(f.baseline.local).toBe("1");
+    await f.sync.tick();
+    expect(f.remoteValue()).toBe(item("remote before opt-in"));
+    expect(f.remote.paste.mock.calls.length + f.remote.commit.mock.calls.length).toBe(1);
   });
 });
 
