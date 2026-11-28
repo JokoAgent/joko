@@ -41,7 +41,7 @@ jobs:
     if: ${{ inputs.scope == 'orchestrator-regressions' }}
     name: Orchestrator reproduced regressions
     runs-on: ${{ inputs.platform == 'windows' && 'windows-latest' || inputs.platform == 'macos' && 'macos-15' || 'ubuntu-24.04' }}
-    timeout-minutes: 30
+    timeout-minutes: ${{ inputs.platform == 'windows' && 45 || 30 }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

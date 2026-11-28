@@ -1,5 +1,5 @@
-import { renameSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { renameSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -19,10 +19,13 @@ afterEach(async () => {
 });
 
 describe("source file reads", () => {
-  it.each(["truncate", "rewrite", "replace"] as const)("retains a capture issue when an editor performs a %s during a source read", async change => {
+  it.each(["truncate", "rewrite", "replace"] as const)("captures only stable bytes when an editor attempts a %s during a source read", async change => {
     const root = await fixture();
     const file = join(root, "USER.md");
     await writeFile(file, "original");
+    const replacement = change === "replace" ? join(await fixture(), "replacement") : undefined;
+    if (replacement) await writeFile(replacement, "modified");
+    let replacementBlocked = false;
     const budget = createImportBudget();
     const failures: string[] = [];
     const files = await readImportTree(root, undefined, {
@@ -34,19 +37,48 @@ describe("source file reads", () => {
           writeFileSync(file, "modified");
           utimesSync(file, new Date(0), new Date(0));
         }
-        if (change === "replace") {
-          writeFileSync(join(root, "replacement"), "modified");
-          renameSync(join(root, "replacement"), file);
+        if (replacement) {
+          try { renameSync(replacement, file); }
+          catch (error) {
+            if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+            replacementBlocked = true;
+          }
         }
       }
     }, (name, error) => {
       expect(error).toMatchObject({ code: "SOURCE_CHANGED" });
       failures.push(name);
     });
-    expect(failures).toEqual(["USER.md"]);
-    expect(files).toEqual([]);
+    if (replacement && replacementBlocked) {
+      expect(failures).toEqual([]);
+      expect(files.map(item => [item.name, item.bytes.toString()])).toEqual([["USER.md", "original"]]);
+      renameSync(replacement, file);
+    } else {
+      expect(failures).toEqual(["USER.md"]);
+      expect(files).toEqual([]);
+    }
     const stable = await readImportFile(root, file);
     expect(stable.bytes.toString()).toBe(change === "truncate" ? "ori" : "modified");
+  });
+
+  it("rejects a logical source path switched to another file while the original handle stays open", async () => {
+    const root = await fixture();
+    const first = join(root, "first"), second = join(root, "second"), current = join(root, "current");
+    await mkdir(first); await mkdir(second);
+    await writeFile(join(first, "USER.md"), "original"); await writeFile(join(second, "USER.md"), "modified");
+    const linkType = process.platform === "win32" ? "junction" : "dir";
+    await symlink(first, current, linkType);
+    const file = join(current, "USER.md");
+    const budget = createImportBudget();
+    await expect(readImportFile(root, file, {
+      ...budget,
+      reserveFile(size) {
+        budget.reserveFile(size);
+        renameSync(current, join(root, "previous"));
+        symlinkSync(second, current, linkType);
+      }
+    })).rejects.toMatchObject({ code: "SOURCE_CHANGED" });
+    expect((await readImportFile(root, file)).bytes.toString()).toBe("modified");
   });
 
   it("keeps complete original bytes, empty markers and nested hidden documents within one budget", async () => {
