@@ -121,6 +121,19 @@ it("opens files using only a current short-lived download URL and never hands a 
   await mount(f); await click("Shared room"); await click("report.txt"); expect(f.media).toHaveBeenCalledWith(expect.objectContaining({ action: "authorize", mediaId: "file" }), expect.anything());
   expect(native.openURL).toHaveBeenCalledExactlyOnceWith("https://authority.test/v1/blobs/download/ticket/short-secret");
 });
+it("retires a pending file open when the user leaves the room", async () => {
+  const f = fixture();
+  f.rows.push(create(contract.PartnerNetworkMessageSchema, { id: "document", sequence: 1n,
+    attachments: [{ id: "file", name: "report.txt", mediaType: "text/plain", sizeBytes: 12n }] }));
+  let finish!: (response: contract.MediaPartnerNetworkResponse) => void;
+  f.media.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await mount(f); await click("Shared room"); await click("report.txt"); await click("Back to group");
+  await act(async () => {
+    finish(create(contract.MediaPartnerNetworkResponseSchema, { downloadUrl: `${f.room.hostOrigin}/v1/blobs/download/file/ticket` }));
+    await pause();
+  });
+  expect(native.openURL).not.toHaveBeenCalled();
+});
 it("shows read-only plans, welcome events and localized task cards without exposing plan controls", async () => {
   const f = fixture(), plan = create(contract.PartnerNetworkPlanSchema, { id: "plan", roomId: "room", requesterId: "owner", status: "proposed", steps: [{ position: 0, actorId: "partner", task: "Write the result", status: "pending" }] });
   f.room.selfId = "reader"; f.room.members.push(create(contract.PartnerNetworkActorSchema, { id: "reader", kind: "human", role: "member", state: "joined", name: "Reader" }));

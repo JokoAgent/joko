@@ -27,10 +27,11 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
   const [retained, setRetained] = useState<readonly contract.PartnerNetworkOutboxEntry[]>([]), [journalReady, setJournalReady] = useState(false);
   const [name, setName] = useState(""), [owned, setOwned] = useState<readonly MobilePartnerDirectoryProfile[]>([]);
   const [nicknames, setNicknames] = useState<Record<string, string>>({});
-  const planAttempt = useRef<{ fingerprint: string; request: contract.PlanPartnerNetworkRequest } | undefined>(undefined);
+  const pendingPlans = useRef(new Map<string, contract.PlanPartnerNetworkRequest>());
   const trackedMentions = useRef<contract.NetworkTrackedMention[]>([]);
   const mentionSelection = useRef<{ start: number; end: number } | undefined>(undefined);
   const lifetime = useRef(new AbortController()), apiRef = useRef(api), following = useRef(true), list = useRef<FlatList<contract.PartnerNetworkMessage>>(null), request = useRef<{ body: string; id: string } | undefined>(undefined), lastRead = useRef(0n), pages = useRef<bigint[]>([]), readVersion = useRef(0), draftRef = useRef(draft);
+  const roomSignal = lifetime.current.signal;
   apiRef.current = api; draftRef.current = draft;
   const journal = useMemo(() => api ? new contract.PartnerNetworkSendJournal(storage, api.ownerKey.replace(/:\d+$/u, "")) : undefined, [api?.ownerKey]);
   const room = snapshot?.room ?? selected, self = room?.members.find(actor => actor.id === room.selfId), admin = self?.state === "joined" && ["owner", "admin"].includes(self.role), canSend = self?.state === "joined" && room?.state === "active" && !!snapshot;
@@ -55,8 +56,19 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
     if (actorId) trackedMentions.current.push({ actorId, label, start: prefix.length }); mentionSelection.current = undefined;
     setDraft(inserted); setMentions(contract.resolveNetworkMentions(inserted, { ...mentionInput, tracked: trackedMentions.current }).actorIds); };
   const failure = (reason: unknown) => reason instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(reason.code) ? m.denied : m.unavailable;
-  const load = async (older = false, signal = lifetime.current.signal) => {
-    const current = apiRef.current, version = ++readVersion.current; if (!current || signal.aborted) return;
+  const selectRoom = (next?: contract.PartnerNetworkRoom) => {
+    lifetime.current.abort();
+    lifetime.current = new AbortController();
+    readVersion.current += 1;
+    pages.current = [];
+    lastRead.current = 0n;
+    following.current = true;
+    setBusy(false); setError(undefined); setMembers(false); setImage(undefined); setNicknames({}); setOwned([]);
+    setSnapshot(undefined); setMessages([]); setSelected(next);
+  };
+  const load = async (older = false, signal = roomSignal) => {
+    const current = apiRef.current; if (!current || signal.aborted || roomSignal.aborted) return;
+    const version = ++readVersion.current;
     try {
       if (!selected) { const response = await current.listPartnerNetwork({}, { signal }); if (!signal.aborted && version === readVersion.current) { setRooms(response.rooms); setError(undefined); } return; }
       const key = { roomId: selected.id, joinId: selected.joinId }, before = older ? messages[0]?.sequence : undefined;
@@ -68,7 +80,8 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
       const rows = [...response.snapshot.messages, ...prior.flatMap(page => page.snapshot?.messages ?? [])];
       setSnapshot(create(contract.PartnerNetworkSnapshotSchema, { ...response.snapshot, hasMore: prior.at(-1)?.snapshot?.hasMore ?? response.snapshot.hasMore }));
       setMessages(previous => [...new Map([...older ? previous : [], ...rows].map(row => [row.id, row])).values()].sort((a, b) => a.sequence < b.sequence ? -1 : 1));
-      setError(undefined); await journal?.displayed(new Set(rows.map(row => row.id)), key); if (!signal.aborted) setRetained(journal?.list() ?? []);
+      setError(undefined); await journal?.displayed(new Set(rows.map(row => row.id)), key);
+      if (!signal.aborted && !roomSignal.aborted && version === readVersion.current) setRetained(journal?.list() ?? []);
     } catch (reason) { if (!signal.aborted && version === readVersion.current) { setError(failure(reason)); if (reason instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(reason.code)) { setMessages([]); setSnapshot(undefined); } } }
   };
   useEffect(() => { let active = true; setJournalReady(false); void journal?.initialize().then(entries => { if (active) { setRetained(entries); setJournalReady(true); } }).catch(() => { if (active) setError(m.unavailable); });
@@ -78,26 +91,30 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
     void directory.list(scope.signal).then(result => { if (!scope.signal.aborted) setOwned(result.partners); }).catch(() => { if (!scope.signal.aborted) setOwned([]); });
     return () => scope.abort(); }, [members, foreground, directory?.ownerKey]);
   useEffect(() => { if (!foreground || !api) return; const scope = new AbortController(); const refresh = () => { void load(false, scope.signal); }; refresh(); const timer = setInterval(refresh, selected ? 2_000 : 5_000);
-    return () => { scope.abort(); clearInterval(timer); }; }, [api?.ownerKey, selected?.id, foreground]);
+    return () => { scope.abort(); clearInterval(timer); }; }, [api?.ownerKey, roomSignal, foreground]);
   const action = async (type: string, actorId = "", value = "") => {
-    if (!api || !target || !room || busy) return; setBusy(true);
-    try { const response = await api.managePartnerNetwork({ ...target, operationId: randomUUID(), expectedRevision: room.revision, action: type, actorId, value }, { signal: lifetime.current.signal });
-      if (!lifetime.current.signal.aborted && response.room) { setSelected(response.room); if (["leave", "remove-list", "archive"].includes(type)) { setMembers(false); setSelected(undefined); setSnapshot(undefined); setMessages([]); } else await load(); } }
-    catch (reason) { if (!lifetime.current.signal.aborted) setError(failure(reason)); } finally { if (!lifetime.current.signal.aborted) setBusy(false); }
+    if (!api || !target || !room || busy || roomSignal.aborted) return; setBusy(true);
+    try { const response = await api.managePartnerNetwork({ ...target, operationId: randomUUID(), expectedRevision: room.revision, action: type, actorId, value }, { signal: roomSignal });
+      if (!roomSignal.aborted && response.room) {
+        if (["leave", "remove-list", "archive"].includes(type)) selectRoom();
+        else { setSelected(response.room); await load(); }
+      } }
+    catch (reason) { if (!roomSignal.aborted) setError(failure(reason)); } finally { if (!roomSignal.aborted) setBusy(false); }
   };
   const confirm = (type: string, actorId = "", value = "", warning = m.destructive) => Alert.alert(m.settings, warning, [{ text: m.cancel, style: "cancel" }, { text: m.confirm, style: "destructive", onPress: () => { void action(type, actorId, value); } }]);
   const actPlan = async (action: string, plan: contract.PartnerNetworkPlan, position = 0, actorId = "") => {
-    if (!api || !target || busy || !canSend) return;
-    const fingerprint = JSON.stringify([target, action, plan.id, plan.revision.toString(), position, actorId]);
-    if (!planAttempt.current) planAttempt.current = { fingerprint,
-      request: create(contract.PlanPartnerNetworkRequestSchema, { ...target, operationId: randomUUID(), action, planId: plan.id, expectedRevision: plan.revision, position, actorId }) };
-    else if (planAttempt.current.request.planId !== plan.id || planAttempt.current.request.action !== action || planAttempt.current.request.position !== position || planAttempt.current.request.actorId !== actorId) return;
+    if (!api || !target || !draftKey || busy || !canSend || roomSignal.aborted) return;
+    const original = pendingPlans.current.get(draftKey);
+    if (original && (original.planId !== plan.id || original.action !== action || original.position !== position || original.actorId !== actorId)) return;
+    const input = original ?? create(contract.PlanPartnerNetworkRequestSchema, { ...target, operationId: randomUUID(),
+      action, planId: plan.id, expectedRevision: plan.revision, position, actorId });
+    pendingPlans.current.set(draftKey, input);
     setBusy(true); setError(undefined);
-    try { await api.planPartnerNetwork(planAttempt.current.request, { signal: lifetime.current.signal }); if (!lifetime.current.signal.aborted) { planAttempt.current = undefined; await load(); } }
-    catch (reason) { if (!lifetime.current.signal.aborted) { if (contract.partnerMutationWasRejected(reason)) planAttempt.current = undefined; setError(failure(reason)); } } finally { if (!lifetime.current.signal.aborted) setBusy(false); }
+    try { await api.planPartnerNetwork(input, { signal: roomSignal }); if (!roomSignal.aborted) { pendingPlans.current.delete(draftKey); await load(); } }
+    catch (reason) { if (!roomSignal.aborted) { if (contract.partnerMutationWasRejected(reason)) pendingPlans.current.delete(draftKey); setError(failure(reason)); } } finally { if (!roomSignal.aborted) setBusy(false); }
   };
   const send = async (previous?: contract.PartnerNetworkOutboxEntry) => {
-    if (!api || !target || !canSend || !journal || !journalReady || busy || !previous && !draft.trim()) return;
+    if (!api || !target || !canSend || !journal || !journalReady || busy || roomSignal.aborted || !previous && !draft.trim()) return;
     const resolved = contract.resolveNetworkMentions(draft, mentionInput), body = JSON.stringify([target, draft, resolved]); if (request.current?.body !== body) request.current = { body, id: randomUUID() };
     const retainedRequest = retained.find(entry => !entry.messageId && entry.request.roomId === target.roomId && entry.request.joinId === target.joinId
       && entry.request.text === draft && entry.request.mentionAll === resolved.all && entry.request.mentionAllPartners === resolved.allPartners
@@ -106,43 +123,45 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
     const input = previous?.request ?? retainedRequest ?? create(contract.SendPartnerNetworkRequestSchema, { ...target, operationId: request.current.id, text: draft,
       mentions: resolved.actorIds, mentionAll: resolved.all, mentionAllPartners: resolved.allPartners });
     setBusy(true); setError(undefined);
-    try { await journal.prepare(input, previous?.createdAt); lifetime.current.signal.throwIfAborted(); setRetained(journal.list());
-      const result = await api.sendPartnerNetwork(input, { signal: lifetime.current.signal }); lifetime.current.signal.throwIfAborted(); if (!result.message) throw new Error();
-      await journal.acknowledge(input.operationId, result.message.id); lifetime.current.signal.throwIfAborted();
+    try { await journal.prepare(input, previous?.createdAt); roomSignal.throwIfAborted(); setRetained(journal.list());
+      const result = await api.sendPartnerNetwork(input, { signal: roomSignal }); roomSignal.throwIfAborted(); if (!result.message) throw new Error();
+      await journal.acknowledge(input.operationId, result.message.id); roomSignal.throwIfAborted();
       if (draftRef.current === input.text) { setDraft(""); setMentions([]); trackedMentions.current = []; request.current = undefined; } await load();
-    } catch (reason) { if (!lifetime.current.signal.aborted) { setRetained(journal.list()); setError(failure(reason)); } } finally { if (!lifetime.current.signal.aborted) setBusy(false); }
+    } catch (reason) { if (!roomSignal.aborted) { setRetained(journal.list()); setError(failure(reason)); } } finally { if (!roomSignal.aborted) setBusy(false); }
   };
   const media = async (attachment: contract.PartnerNetworkAttachment) => {
-    if (!api || !target || !room || busy) return; setBusy(true);
+    if (!api || !target || !room || busy || roomSignal.aborted) return; setBusy(true);
     try {
       if (!attachment.mediaType.startsWith("image/")) {
-        const response = await api.mediaPartnerNetwork({ ...target, action: "authorize", mediaId: attachment.id }, { signal: lifetime.current.signal }); lifetime.current.signal.throwIfAborted();
+        const response = await api.mediaPartnerNetwork({ ...target, action: "authorize", mediaId: attachment.id }, { signal: roomSignal }); roomSignal.throwIfAborted();
         const url = new URL(response.downloadUrl); if (url.origin !== room.hostOrigin || !["https:", "http:"].includes(url.protocol) || url.username || url.password || !/^\/v1\/blobs\/download\/[^/]+\/[^/]+$/u.test(url.pathname) || url.search || url.hash) throw new Error();
         await Linking.openURL(url.href); return;
       }
       if (attachment.sizeBytes > 20n * 1024n * 1024n) throw new Error();
       const bytes = new Uint8Array(Number(attachment.sizeBytes)); let offset = 0n;
-      while (offset < attachment.sizeBytes) { const response = await api.mediaPartnerNetwork({ ...target, action: "read", mediaId: attachment.id, offset }, { signal: lifetime.current.signal }); lifetime.current.signal.throwIfAborted();
+      while (offset < attachment.sizeBytes) { const response = await api.mediaPartnerNetwork({ ...target, action: "read", mediaId: attachment.id, offset }, { signal: roomSignal }); roomSignal.throwIfAborted();
         if (response.offset !== offset + BigInt(response.data.length) || !response.data.length || response.offset > attachment.sizeBytes) throw new Error(); bytes.set(response.data, Number(offset)); offset = response.offset; }
       const decoded = inspectMobileImageGalleryBytes(bytes, attachment.mediaType);
       setImage({ leaseId: randomUUID(), fileName: attachment.name, sourceBase64: encodeMobileBase64(bytes), sourceMediaType: attachment.mediaType, previewUri: mobileImageGalleryPreviewUri(bytes, decoded),
         initialStrokes: [], annotatable: false, expectedWidthPixels: decoded.width, expectedHeightPixels: decoded.height, animated: decoded.animated === true, maximumBytes: 20 * 1024 * 1024 });
-    } catch (reason) { if (!lifetime.current.signal.aborted) setError(failure(reason)); } finally { if (!lifetime.current.signal.aborted) setBusy(false); }
+    } catch (reason) { if (!roomSignal.aborted) setError(failure(reason)); } finally { if (!roomSignal.aborted) setBusy(false); }
   };
   const markVisible = (through: bigint | undefined) => {
-    if (!foreground || !following.current || !api || !target || !through || through <= lastRead.current) return;
-    lastRead.current = through; void api.managePartnerNetwork({ ...target, operationId: randomUUID(), action: "mark-read", throughSequence: through }, { signal: lifetime.current.signal }).catch(() => { lastRead.current = 0n; });
+    if (!foreground || !following.current || !api || !target || !through || through <= lastRead.current || roomSignal.aborted) return;
+    lastRead.current = through; void api.managePartnerNetwork({ ...target, operationId: randomUUID(), action: "mark-read", throughSequence: through }, { signal: roomSignal }).catch(() => {
+      if (!roomSignal.aborted && lastRead.current === through) lastRead.current = 0n;
+    });
   };
   const markVisibleRef = useRef(markVisible); markVisibleRef.current = markVisible;
   const viewable = useRef(({ viewableItems }: { viewableItems: readonly { isViewable: boolean; item: contract.PartnerNetworkMessage }[] }) => markVisibleRef.current(viewableItems.filter(item => item.isViewable).map(item => item.item.sequence).sort((a, b) => a < b ? -1 : 1).at(-1))).current;
   const viewability = useRef({ itemVisiblePercentThreshold: 65, minimumViewTime: 250 }).current;
   const button = (label: string, onPress: () => void, disabled = false) => label === m.continue && !snapshot?.canContinue ? null : <Pressable accessibilityRole="button" accessibilityState={{ disabled }} disabled={disabled} onPress={onPress} style={[styles.button, { borderColor: colors.border, opacity: disabled ? 0.45 : 1 }]}><Text style={{ color: colors.ink }}>{label}</Text></Pressable>;
-  return <View style={[styles.screen, { backgroundColor: colors.canvas ?? colors.background }]}><View style={styles.header}>{button(m.back, () => { if (selected) { setSelected(undefined); setSnapshot(undefined); setMessages([]); pages.current = []; } else onBack(); })}<Text style={[styles.title, { color: colors.ink }]}>{room?.name ?? m.title}</Text>{selected ? button(m.settings, () => { setName(room?.name ?? ""); setMembers(true); }, !room) : button(m.refresh, () => { void load(); }, !api)}</View>
+  return <View style={[styles.screen, { backgroundColor: colors.canvas ?? colors.background }]}><View style={styles.header}>{button(m.back, () => { if (selected) selectRoom(); else onBack(); })}<Text style={[styles.title, { color: colors.ink }]}>{room?.name ?? m.title}</Text>{selected ? button(m.settings, () => { setName(room?.name ?? ""); setMembers(true); }, !room) : button(m.refresh, () => { void load(); }, !api)}</View>
     {error && <Text accessibilityRole="alert" style={[styles.notice, { color: colors.negative }]}>{error}</Text>}
     {failures.error && !error && <Text style={[styles.notice, { color: colors.muted }]}>{m.unavailable}</Text>}
     {!api && <Text style={[styles.notice, { color: colors.muted }]}>{m.unavailable}</Text>}
     {!selected ? <><View style={styles.header}>{button(m.showArchived, () => setHistory(value => !value))}</View><FlatList data={rooms?.filter(item => !item.removedFromList && (history || item.state === "active"))} keyExtractor={item => `${item.hostServerId}:${item.id}`} ListEmptyComponent={!rooms && api ? <ActivityIndicator color={colors.accent} /> : <Text style={{ color: colors.muted }}>{m.empty}</Text>}
-      renderItem={({ item }) => <Pressable accessibilityRole="button" onPress={() => { pages.current = []; lastRead.current = 0n; setSelected(item); setSnapshot(undefined); }} style={[styles.row, { borderColor: colors.border }]}><Text style={[styles.title, { color: colors.ink }]}>{item.name}{item.unread ? ` · ${m.unread}` : ""}</Text><Text style={{ color: colors.muted }}>{item.state === "archived" ? m.archived : item.members.filter(actor => actor.state === "joined").map(actor => contract.partnerNetworkActorName(actor, item)).join(" · ")}</Text></Pressable>} /></>
+      renderItem={({ item }) => <Pressable accessibilityRole="button" onPress={() => selectRoom(item)} style={[styles.row, { borderColor: colors.border }]}><Text style={[styles.title, { color: colors.ink }]}>{item.name}{item.unread ? ` · ${m.unread}` : ""}</Text><Text style={{ color: colors.muted }}>{item.state === "archived" ? m.archived : item.members.filter(actor => actor.state === "joined").map(actor => contract.partnerNetworkActorName(actor, item)).join(" · ")}</Text></Pressable>} /></>
       : <><FlatList ref={list} data={messages} keyExtractor={item => item.id} contentContainerStyle={styles.timeline} onScroll={event => { const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent; following.current = contentSize.height - contentOffset.y - layoutMeasurement.height < 48; }}
         onContentSizeChange={() => { if (following.current) list.current?.scrollToEnd({ animated: false }); }} onViewableItemsChanged={viewable} viewabilityConfig={viewability}
         ListHeaderComponent={snapshot?.hasMore ? button(m.older, () => { following.current = false; void load(true); }) : undefined}
