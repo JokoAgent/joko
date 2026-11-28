@@ -5,7 +5,7 @@ import type { AdapterContext, PromptInput } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
-import { InstrumentedFakeAdapter, OrchestratorE2eFixture, selectSystemTheme, setBrowserColorScheme, waitFor } from "./fixture.js";
+import { closeCompactNavigationDrawer, InstrumentedFakeAdapter, OrchestratorE2eFixture, selectSystemTheme, setBrowserColorScheme, waitFor } from "./fixture.js";
 import { createSessionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 const browserPath = process.env["JOKO_BROWSER_EXECUTABLE"]?.trim();
@@ -59,12 +59,18 @@ mountedIt("keeps question references read-only and answers explicit in the produ
   expect(await file.getAttribute("href")).toContain("README.md");
   const evidenceDirectory = process.env["JOKO_QUESTION_EVIDENCE_DIR"]?.trim();
   if (evidenceDirectory) await mkdir(evidenceDirectory, { recursive: true });
-  for (const theme of ["light", "dark"] as const) {
-    await setBrowserColorScheme(page, theme);
-    for (const width of [1280, 390]) {
-      await page.setViewportSize({ width, height: 900 });
-      if (await page.locator(".panel-scrim--navigation").isVisible()) await page.locator(".sidebar").getByRole("button", { name: "Close navigation", exact: true }).click();
-      await answer.focus();
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    if (width === 390) {
+      await closeCompactNavigationDrawer(page);
+      const closeDetails = page.locator(".inspector-dock-group[data-edge]").getByRole("button", { name: "Close details", exact: true });
+      if (await closeDetails.isVisible()) await closeDetails.click();
+      await closeDetails.waitFor({ state: "hidden" });
+    }
+    for (const theme of ["light", "dark"] as const) {
+      await setBrowserColorScheme(page, theme);
+      await question.getByRole("button", { name: "Continue", exact: true }).click({ trial: true });
+      await answer.click();
       expect(await answer.evaluate(element => element === element.ownerDocument.activeElement)).toBe(true);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
       if (evidenceDirectory) await page.screenshot({ path: resolve(evidenceDirectory, `question-${theme}-${width}.png`), fullPage: true });

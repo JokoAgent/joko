@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
-import { OrchestratorE2eFixture, selectSystemTheme, setBrowserColorScheme } from "./fixture.js";
+import { closeCompactNavigationDrawer, OrchestratorE2eFixture, selectSystemTheme, setBrowserColorScheme } from "./fixture.js";
 
 const execute = promisify(execFile), browserPath = process.env.JOKO_BROWSER_EXECUTABLE?.trim(), webDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
 const mountedIt = browserPath && webDirectory ? it : it.skip;
@@ -44,15 +44,11 @@ mountedIt("updates the selected branch through the production page and recovers 
   expect(await git(repository, "rev-parse", "origin/main")).toBe(original); expect(mutations).toBe(0);
   const evidence = process.env.RUNNER_TEMP ? resolve(process.env.RUNNER_TEMP, "joko-web-evidence/worktree-branch-sync") : undefined;
   if (evidence) await mkdir(evidence, { recursive: true });
-  for (const theme of ["light", "dark"] as const) {
-    await setBrowserColorScheme(page, theme);
-    for (const width of [1280, 390]) {
-      await page.setViewportSize({ width, height: 900 });
-      const navigationScrim = page.locator(".panel-scrim--navigation");
-      if (width === 390 && await navigationScrim.isVisible()) {
-        await page.locator(".sidebar").getByRole("button", { name: "Close navigation", exact: true }).click();
-        await navigationScrim.waitFor({ state: "hidden" });
-      }
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    if (width === 390) await closeCompactNavigationDrawer(page);
+    for (const theme of ["light", "dark"] as const) {
+      await setBrowserColorScheme(page, theme);
       const button = page.getByRole("button", { name: "Update selected branch", exact: true });
       await expect.poll(() => button.isEnabled(), { timeout: 10_000 }).toBe(true);
       await button.focus();
