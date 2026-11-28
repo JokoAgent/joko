@@ -289,6 +289,7 @@ export function buildMobilePdfViewerHtml({
       var passwordText = document.getElementById('password-text');
       var passwordReply = null;
       var findGeneration = 0;
+      var findReader = null;
       var MAX_BYTES = ${MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES};
       var MAX_CHUNK = ${mobilePdfViewerLimits.maximumChunkBytes};
       var MAX_PAGES = ${mobilePdfViewerLimits.maximumPageCount};
@@ -586,6 +587,7 @@ export function buildMobilePdfViewerHtml({
         renderGeneration += 1; renderTasks.forEach(function (task) { task.cancel(); }); renderTasks.clear();
         rendered.clear(); seen.clear(); resident = [];
         document.querySelectorAll('.page-content').forEach(removePageContent);
+        document.querySelectorAll('.page').forEach(function (section) { section.style.removeProperty('width'); });
         renderVisiblePages(); emit(seen.size === pageCount ? 'complete' : 'rendering', null);
       }
       function readingAnchor(target, x, y) {
@@ -749,33 +751,60 @@ export function buildMobilePdfViewerHtml({
 
       window.addEventListener('message', handleCommand); document.addEventListener('message', handleCommand);
       pages.addEventListener('scroll', function () { renderVisiblePages(); updateCurrentPage(); }, { passive: true });
-      function closeFind() {
-        findGeneration++; findForm.hidden = true; findText.value = ''; findResult.textContent = '';
+      function cancelFind() {
+        findGeneration++;
+        if (findReader) { void findReader.cancel().catch(function () {}); findReader = null; }
+        findResult.textContent = '';
       }
-      async function findPages(query, generation) {
+      function closeFind() {
+        cancelFind(); findForm.hidden = true; findText.value = '';
+      }
+      async function pageMatches(page, query, generation) {
+        var reader = page.streamTextContent().getReader();
+        var tail = '', separator = '';
+        findReader = reader;
+        try {
+          while (generation === findGeneration) {
+            var chunk = await reader.read();
+            if (chunk.done || generation !== findGeneration) return false;
+            for (var item of chunk.value.items) {
+              if (typeof item.str !== 'string') continue;
+              var part = tail + separator + item.str.toLocaleLowerCase();
+              if (part.includes(query)) return true;
+              tail = query.length > 1 ? part.slice(1 - query.length) : '';
+              separator = ' ';
+            }
+          }
+          return false;
+        } finally {
+          if (findReader === reader) { findReader = null; await reader.cancel().catch(function () {}); }
+          reader.releaseLock();
+        }
+      }
+      async function findPages(query, generation, navigation) {
         var matches = 0, first = 0;
         for (var number = 1; number <= pageCount; number++) {
           var page = await pdfDocument.getPage(number);
           if (generation !== findGeneration) return;
-          var content = await page.getTextContent();
+          var found = await pageMatches(page, query, generation);
           if (generation !== findGeneration) return;
-          var body = content.items.map(function (item) { return item.str || ''; }).join(' ');
-          if (body.toLocaleLowerCase().includes(query)) { matches++; if (!first) first = number; }
+          if (found) { matches++; if (!first) first = number; }
         }
         findResult.textContent = text(labels.matches, { pages: matches });
-        if (first) {
-          linkRequest++; currentPage = first;
+        if (first && navigation === linkRequest) {
+          currentPage = first;
           document.getElementById('page-' + first).scrollIntoView({ block: 'start' }); emit(currentState, null);
         }
       }
       document.getElementById('find-close').addEventListener('click', closeFind);
-      findText.addEventListener('input', function () { findGeneration++; findResult.textContent = ''; });
+      findText.addEventListener('input', cancelFind);
       findForm.addEventListener('submit', function (event) {
         event.preventDefault();
         if (disposed || findForm.hidden || !textSelectionAllowed) return;
-        var generation = ++findGeneration, query = findText.value.trim().toLocaleLowerCase();
-        findText.blur(); findResult.textContent = '';
-        if (query) void findPages(query, generation).catch(function () {
+        cancelFind();
+        var generation = findGeneration, query = findText.value.trim().toLocaleLowerCase();
+        findText.blur();
+        if (query) void findPages(query, generation, ++linkRequest).catch(function () {
           if (generation === findGeneration) findResult.textContent = labels.error;
         });
       });
