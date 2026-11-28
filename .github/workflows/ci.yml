@@ -255,6 +255,10 @@ jobs:
         run: |
           pnpm --filter @joko/store exec vitest run src/device-authorization-store.test.ts 2>&1 | tee "$RUNNER_TEMP/device-authorization/store.log"
           pnpm --filter @joko/connection-transport exec vitest run device-authorization trust entries 2>&1 | tee "$RUNNER_TEMP/device-authorization/client.log"
+      - name: Check remote clipboard receipts and permission recovery on both clients
+        if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/remote-desktop-sync --filter @joko/desktop --filter @joko/mobile -r --no-bail exec vitest run --reporter=verbose clipboard-sync.test.ts remote-desktop-controller.test.ts 2>&1 | tee "$RUNNER_TEMP/device-authorization/clipboard.log"
       - name: Check affected client types
         if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
         shell: bash

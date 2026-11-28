@@ -184,7 +184,7 @@ describe("clipboard sync", () => {
       await f.remote.paste(transfer.data, transfer.version!);
       throw new ClipboardSyncError("unknown");
     });
-    await expect(f.sync.tick()).rejects.toMatchObject({ reason: "unknown" });
+    await expect(f.sync.tick()).rejects.toMatchObject({ reason: "outcome-unknown" });
     expect(f.remote.write.mock.calls.every(([, , data]) => data.length <= CLIPBOARD_SYNC_CHUNK_CHARS)).toBe(true);
     expect(f.remote.write.mock.calls.map(([, , data]) => Buffer.from(data, "utf8").toString("utf8")).join("")).toBe(f.local());
     await f.sync.tick();
@@ -196,6 +196,16 @@ describe("clipboard sync", () => {
     const f = fixture(); f.remote.version.mockResolvedValueOnce("invalid");
     await expect(f.sync.tick()).rejects.toMatchObject({ reason: "unsupported" });
     expect(f.remote.copy).not.toHaveBeenCalled(); expect(f.remote.paste).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("requires reconciliation after a write with a malformed version (inline=%s)", async inline => {
+    const f = fixture(inline);
+    await f.sync.tick();
+    f.setLocal(item("changed after the baseline"));
+    (inline ? f.remote.paste : f.remote.commit).mockResolvedValueOnce("");
+    await expect(f.sync.tick()).rejects.toMatchObject({ reason: "outcome-unknown" });
+    expect(f.transfers.size).toBe(0);
+    expect(f.baseline.local).toBe("1");
   });
 });
 

@@ -16,7 +16,7 @@ function fixture(opaque = false) {
   let localVersion = 1, remoteVersion = 1, syncGeneration = 0n, enabled = false;
   let localJson = '{"text":"local baseline"}', remoteJson = '{"text":"remote baseline"}';
   let pendingAck: Promise<void> | undefined, permission = false;
-  let unknownNative = false, unknownRemote = false;
+  let unknownNative = false, unknownRemote = false, loseRemoteReceipt = false;
   const versionOf = (counter: number, json: string) => opaque ? createHash("sha256").update(json).digest("hex") : String(counter);
   const remoteWrite = vi.fn(), localWrite = vi.fn();
   const calls: { name: string; input: any }[] = [];
@@ -33,6 +33,10 @@ function fixture(opaque = false) {
         if (transfer.action.case === "copy") { expect(transfer.version).toBe(versionOf(remoteVersion, remoteJson)); output = { result: { data: remoteJson, length: remoteJson.length } }; }
         else if (transfer.action.case === "paste") {
           expect(transfer.version).toBe(versionOf(remoteVersion, remoteJson)); remoteWrite(transfer.action.value.data);
+          if (loseRemoteReceipt) {
+            loseRemoteReceipt = false;
+            return { ok: false, code: Code.Unavailable, reason: RemoteDesktopFailureReason.UNSPECIFIED };
+          }
           remoteJson = transfer.action.value.data; remoteVersion++; const version = versionOf(remoteVersion, remoteJson);
           if (unknownRemote) { unknownRemote = false; return { ok: false, code: Code.Aborted, reason: RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE }; }
           if (pendingAck) await pendingAck; output = { result: { version } };
@@ -60,6 +64,7 @@ function fixture(opaque = false) {
     remote: (text: string) => { remoteJson = JSON.stringify({ text }); remoteVersion++; },
     deferAck: (promise?: Promise<void>) => { pendingAck = promise; }, permission: (value: boolean) => { permission = value; },
     unknown: (side: "local" | "remote") => { if (side === "local") unknownNative = true; else unknownRemote = true; },
+    loseRemoteReceipt: () => { loseRemoteReceipt = true; },
     localJson: () => localJson, remoteJson: () => remoteJson };
 }
 
@@ -99,6 +104,19 @@ describe("Desktop viewer Main clipboard sync owner", () => {
     f.owner.retry(); await flush(); expect(f.owner.snapshot).toMatchObject({ active: true, notice: undefined });
     await vi.advanceTimersByTimeAsync(3000); await flush();
     expect(f.localWrite.mock.calls.length + f.remoteWrite.mock.calls.length).toBe(1);
+  });
+
+  it("pauses after losing the paste reply even when the host still reports its old version", async () => {
+    const f = fixture(); f.update({ desired: true }); await flush();
+    f.loseRemoteReceipt();
+    f.local("copied before the connection dropped");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.remoteWrite).toHaveBeenCalledTimes(1);
+    expect(f.owner.snapshot.notice).toBe("unknown");
+    f.owner.retry(); await flush();
+    expect(f.remoteWrite).toHaveBeenCalledTimes(1);
+    f.local("copied after retry"); await vi.advanceTimersByTimeAsync(1500);
+    expect(f.remoteJson()).toBe(f.localJson());
   });
 
   it("preserves focus-pause baseline, retains both sides on conflict and requires explicit retry for permission", async () => {

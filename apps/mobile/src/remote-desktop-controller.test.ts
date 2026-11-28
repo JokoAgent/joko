@@ -1269,10 +1269,12 @@ describe("Mobile clipboard sync lifecycle and effect authority", () => {
     await h.controller.close();
   });
 
-  it("requires explicit sync Retry for a typed Linux outcome-unknown write without replaying its payload", async () => {
+  it.each(["host", "transport", "missing-version"] as const)("requires explicit sync Retry after a %s paste receipt failure", async failure => {
     vi.useFakeTimers(); const h = await syncFixture();
     h.local("phone change with an unconfirmed remote effect");
     h.clipboardContent.mockImplementationOnce(async () => {
+      if (failure === "transport") throw new ConnectError("Connection lost", Code.Unavailable);
+      if (failure === "missing-version") return create(RemoteDesktopClipboardContentResultSchema);
       throw new ConnectError("Unconfirmed clipboard write", Code.Aborted, undefined, [{ desc: RemoteDesktopFailureSchema,
         value: create(RemoteDesktopFailureSchema, { reason: RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE, retryable: false }) }]);
     });
@@ -1283,6 +1285,18 @@ describe("Mobile clipboard sync lifecycle and effect authority", () => {
     await h.controller.retryClipboardSync(); await vi.advanceTimersByTimeAsync(3000);
     expect(h.controller.snapshot.clipboardSyncActive).toBe(true);
     expect(h.clipboardContent.mock.calls.filter(([, request]) => request.action.case === "paste")).toHaveLength(1);
+    await h.controller.close();
+  });
+
+  it("waits for an explicit retry when the remote clipboard permission is denied", async () => {
+    vi.useFakeTimers(); const h = await syncFixture(false);
+    h.clipboardVersion.mockRejectedValueOnce(new ConnectError("Permission denied", Code.PermissionDenied));
+    await h.controller.setClipboardSync(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.clipboardVersion).toHaveBeenCalledTimes(1);
+    expect(h.controller.snapshot.clipboardSyncNotice).toBe("permission");
+    await h.controller.retryClipboardSync(); await vi.advanceTimersByTimeAsync(0);
+    expect(h.controller.snapshot.clipboardSyncActive).toBe(true);
     await h.controller.close();
   });
 
