@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Alert, FlatList, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { randomUUID } from "expo-crypto";
@@ -32,6 +32,14 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
   const mentionSelection = useRef<{ start: number; end: number } | undefined>(undefined);
   const lifetime = useRef(new AbortController()), apiRef = useRef(api), following = useRef(true), list = useRef<FlatList<contract.PartnerNetworkMessage>>(null), request = useRef<{ body: string; id: string } | undefined>(undefined), lastRead = useRef(0n), pages = useRef<bigint[]>([]), readVersion = useRef(0), draftVersion = useRef(0);
   const roomSignal = lifetime.current.signal;
+  const mediaRequest = useRef<AbortController | undefined>(undefined);
+  useLayoutEffect(() => {
+    if (mediaRequest.current) {
+      mediaRequest.current.abort();
+      mediaRequest.current = undefined;
+      setBusy(false);
+    }
+  }, [foreground, roomSignal]);
   apiRef.current = api;
   const journal = useMemo(() => api ? new contract.PartnerNetworkSendJournal(storage, api.ownerKey.replace(/:\d+$/u, "")) : undefined, [api?.ownerKey]);
   const room = snapshot?.room ?? selected, self = room?.members.find(actor => actor.id === room.selfId), admin = self?.state === "joined" && ["owner", "admin"].includes(self.role), canSend = self?.state === "joined" && room?.state === "active" && !!snapshot;
@@ -82,7 +90,12 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
       const prior = older ? [] : await Promise.all(pages.current.map(beforeSequence => current.getPartnerNetwork({ ...key, beforeSequence }, { signal })));
       if (signal.aborted || version !== readVersion.current) return;
       const rows = [...response.snapshot.messages, ...prior.flatMap(page => page.snapshot?.messages ?? [])];
-      setSnapshot(create(contract.PartnerNetworkSnapshotSchema, { ...response.snapshot, hasMore: prior.at(-1)?.snapshot?.hasMore ?? response.snapshot.hasMore }));
+      const plans = new Map<string, contract.PartnerNetworkPlan>();
+      for (const plan of [...older ? snapshot?.plans ?? [] : [], ...response.snapshot.plans, ...prior.flatMap(page => page.snapshot?.plans ?? [])]) {
+        const previous = plans.get(plan.id);
+        if (!previous || previous.revision <= plan.revision) plans.set(plan.id, plan);
+      }
+      setSnapshot(create(contract.PartnerNetworkSnapshotSchema, { ...response.snapshot, plans: [...plans.values()], hasMore: prior.at(-1)?.snapshot?.hasMore ?? response.snapshot.hasMore }));
       setMessages(previous => [...new Map([...older ? previous : [], ...rows].map(row => [row.id, row])).values()].sort((a, b) => a.sequence < b.sequence ? -1 : 1));
       setError(undefined); await journal?.displayed(new Set(rows.map(row => row.id)), key);
       if (!signal.aborted && !roomSignal.aborted && version === readVersion.current) setRetained(journal?.list() ?? []);
@@ -138,21 +151,25 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
     } catch (reason) { if (!roomSignal.aborted) { setRetained(journal.list()); setError(failure(reason)); } } finally { if (!roomSignal.aborted) setBusy(false); }
   };
   const media = async (attachment: contract.PartnerNetworkAttachment) => {
-    if (!api || !target || !room || busy || roomSignal.aborted) return; setBusy(true);
+    if (!api || !target || !room || !foreground || busy || mediaRequest.current || roomSignal.aborted) return;
+    mediaRequest.current = new AbortController();
+    const signal = AbortSignal.any([roomSignal, mediaRequest.current.signal]);
+    setBusy(true);
     try {
       if (!attachment.mediaType.startsWith("image/")) {
-        const response = await api.mediaPartnerNetwork({ ...target, action: "authorize", mediaId: attachment.id }, { signal: roomSignal }); roomSignal.throwIfAborted();
+        const response = await api.mediaPartnerNetwork({ ...target, action: "authorize", mediaId: attachment.id }, { signal }); signal.throwIfAborted();
         const url = new URL(response.downloadUrl); if (url.origin !== room.hostOrigin || !["https:", "http:"].includes(url.protocol) || url.username || url.password || !/^\/v1\/blobs\/download\/[^/]+\/[^/]+$/u.test(url.pathname) || url.search || url.hash) throw new Error();
         await Linking.openURL(url.href); return;
       }
       if (attachment.sizeBytes > 20n * 1024n * 1024n) throw new Error();
       const bytes = new Uint8Array(Number(attachment.sizeBytes)); let offset = 0n;
-      while (offset < attachment.sizeBytes) { const response = await api.mediaPartnerNetwork({ ...target, action: "read", mediaId: attachment.id, offset }, { signal: roomSignal }); roomSignal.throwIfAborted();
+      while (offset < attachment.sizeBytes) { const response = await api.mediaPartnerNetwork({ ...target, action: "read", mediaId: attachment.id, offset }, { signal }); signal.throwIfAborted();
         if (response.offset !== offset + BigInt(response.data.length) || !response.data.length || response.offset > attachment.sizeBytes) throw new Error(); bytes.set(response.data, Number(offset)); offset = response.offset; }
       const decoded = inspectMobileImageGalleryBytes(bytes, attachment.mediaType);
       setImage({ leaseId: randomUUID(), fileName: attachment.name, sourceBase64: encodeMobileBase64(bytes), sourceMediaType: attachment.mediaType, previewUri: mobileImageGalleryPreviewUri(bytes, decoded),
         initialStrokes: [], annotatable: false, expectedWidthPixels: decoded.width, expectedHeightPixels: decoded.height, animated: decoded.animated === true, maximumBytes: 20 * 1024 * 1024 });
-    } catch (reason) { if (!roomSignal.aborted) setError(failure(reason)); } finally { if (!roomSignal.aborted) setBusy(false); }
+    } catch (reason) { if (!signal.aborted) setError(failure(reason)); }
+    finally { if (!signal.aborted) { mediaRequest.current = undefined; setBusy(false); } }
   };
   const markVisible = (through: bigint | undefined) => {
     if (!foreground || !following.current || !api || !target || !through || through <= lastRead.current || roomSignal.aborted) return;
