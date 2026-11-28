@@ -207,14 +207,15 @@ describe("Provider model discovery", () => {
   it("keeps an Anthropic before_id listing partial and pages backwards with first_id", async () => {
     const baseUrl = "https://api.example.test/v1";
     const modelsEndpoint = `${baseUrl}/models?before_id=anchor&scope=team`;
-    const request = vi.fn(async (input: string | URL | Request) => {
+    const request = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("x-api-key")).toBe("test-key");
       const query = new URL(String(input)).searchParams;
       if (query.has("after_id")) return new Response(null, { status: 400 });
       return query.get("before_id") === "anchor"
         ? Response.json({ data: [{ id: "b" }, { id: "c" }], has_more: true, first_id: "b", last_id: "c" })
         : Response.json({ data: [{ id: "a" }], has_more: false, first_id: "a", last_id: "a" });
     });
-    const catalog = await fetchProviderModelCatalog({ api: "anthropic-messages", baseUrl, modelsEndpoint }, request);
+    const catalog = await fetchProviderModelCatalog({ api: "anthropic-messages", apiKey: "test-key", baseUrl, modelsEndpoint }, request);
     expect(request.mock.calls.map(([url]) => String(url))).toEqual([modelsEndpoint, `${baseUrl}/models?before_id=b&scope=team`]);
     expect(catalog.listedIds).toEqual(new Set(["a", "b", "c"]));
     expect(catalog.complete).toBe(false);
