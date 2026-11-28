@@ -168,6 +168,37 @@ describe("Shared conversation UI receipts", () => {
     const original = f.api.sendPartnerNetwork.mock.calls[0]![0]; expect(original).toMatchObject({ mentionAll: true, forcePlan: true });
     await act(async () => { button("Edit", view.element).click(); await settle(); button("Send", view.element).click(); await settle(); }); expect(f.api.sendPartnerNetwork.mock.calls[1]![0]).toEqual(original);
   });
+  it("keeps a picked recipient when resubmitting an unchanged message whose text also names an audience", async () => {
+    const f = setup();
+    const member = create(wire.PartnerNetworkActorSchema, { id: "person", name: "all", kind: "human", state: "joined" });
+    f.api.getPartnerNetwork.mockImplementation(async () => create(wire.GetPartnerNetworkResponseSchema, {
+      snapshot: { room: { ...room, members: [...room.members, member] }, messages: f.rows }
+    }));
+    f.api.sendPartnerNetwork.mockRejectedValueOnce(new ConnectError("Reply lost", Code.Unavailable));
+    const view = await mount(<PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />);
+    await act(async () => { button("@all", view.element).click(); await settle(); });
+    await act(async () => { button("Send", view.element).click(); await settle(); });
+    const original = f.api.sendPartnerNetwork.mock.calls[0]![0];
+    expect(original).toMatchObject({ mentions: [member.id], mentionAll: false });
+    await act(async () => { button("Edit", view.element).click(); await settle(); });
+    await act(async () => { button("Send", view.element).click(); await settle(); });
+    expect(f.api.sendPartnerNetwork.mock.calls[1]![0]).toEqual(original);
+  });
+  it("retains the edited send's identity with its draft when returning to the room", async () => {
+    const f = setup(); f.api.sendPartnerNetwork.mockRejectedValueOnce(new ConnectError("Reply lost", Code.Unavailable));
+    const page = () => <PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />;
+    const view = await mount(page());
+    await fill(view.element.querySelector("textarea")!, "Keep this send");
+    await act(async () => { button("Send", view.element).click(); await settle(); });
+    const original = f.api.sendPartnerNetwork.mock.calls[0]![0];
+    await act(async () => { button("Edit", view.element).click(); await settle(); });
+    await act(async () => view.root.unmount()); roots.splice(roots.indexOf(view.root), 1); view.element.remove();
+    const resumed = await mount(page());
+    expect(resumed.element.querySelector("textarea")!.value).toBe(original.text);
+    expect(f.api.sendPartnerNetwork).toHaveBeenCalledTimes(1);
+    await act(async () => { button("Send", resumed.element).click(); await settle(); });
+    expect(f.api.sendPartnerNetwork.mock.calls[1]![0]).toEqual(original);
+  });
   it.each([false, true])("shows the disabled-by-default companion audience setting only on a capable authority (%s)", async supported => {
     const f = setup();
     f.api.getPartnerNetwork.mockImplementation(async () => create(wire.GetPartnerNetworkResponseSchema, { snapshot: { room: { ...room, supportsMentionAudiences: supported } } }));

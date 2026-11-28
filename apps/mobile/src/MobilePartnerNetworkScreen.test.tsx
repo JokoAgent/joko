@@ -116,6 +116,40 @@ it("keeps a late send in its original room when the user opens a second conversa
   expect(document.body.textContent).not.toContain("Shared room");
   expect(f.send).toHaveBeenCalledTimes(1);
 });
+it("allocates a fresh ID for a new send of the same text after the original was confirmed", async () => {
+  const f = fixture();
+  let finish!: (response: contract.SendPartnerNetworkResponse) => void;
+  f.send.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await mount(f, { ...f.api, ownerKey: "confirmed-send:1" }); await click("Shared room"); await fill("Same message"); await click("Send");
+  const original = f.send.mock.calls[0]![0];
+  await fill("Working on the next message");
+  await act(async () => {
+    finish(create(contract.SendPartnerNetworkResponseSchema, { message: { id: "original-message" } }));
+    await pause();
+  });
+  expect(document.querySelector<HTMLInputElement>('[aria-label="Message"]')?.value).toBe("Working on the next message");
+  await fill("Same message"); await click("Send");
+  expect(f.send).toHaveBeenCalledTimes(2);
+  expect(f.send.mock.calls[1]![0].operationId).not.toBe(original.operationId);
+});
+it("keeps a newly typed audience while an identical-looking personal mention is being confirmed", async () => {
+  const f = fixture();
+  f.room.members.push(create(contract.PartnerNetworkActorSchema, { id: "person", name: "all", kind: "human", state: "joined" }));
+  let finish!: (response: contract.SendPartnerNetworkResponse) => void;
+  f.send.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await mount(f, { ...f.api, ownerKey: "edited-audience:1" }); await click("Shared room"); await click("@all"); await click("Send");
+  const original = f.send.mock.calls[0]![0];
+  expect(original).toMatchObject({ text: "@all ", mentions: ["person"], mentionAll: false });
+  await fill(""); await fill("@all ");
+  await act(async () => {
+    finish(create(contract.SendPartnerNetworkResponseSchema, { message: { id: "personal-message" } }));
+    await pause();
+  });
+  expect(document.querySelector<HTMLInputElement>('[aria-label="Message"]')?.value).toBe("@all ");
+  await click("Send");
+  expect(f.send.mock.calls[1]![0]).toMatchObject({ text: "@all ", mentions: [], mentionAll: true });
+  expect(f.send.mock.calls[1]![0].operationId).not.toBe(original.operationId);
+});
 it("opens files using only a current short-lived download URL and never hands a membership bearer to the system", async () => {
   const f = fixture(); f.rows.push(create(contract.PartnerNetworkMessageSchema, { id: "file-message", authorId: "partner", text: "A document", sequence: 1n, attachments: [{ id: "file", name: "report.txt", mediaType: "text/plain", sizeBytes: 12n }] }));
   await mount(f); await click("Shared room"); await click("report.txt"); expect(f.media).toHaveBeenCalledWith(expect.objectContaining({ action: "authorize", mediaId: "file" }), expect.anything());
