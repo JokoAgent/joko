@@ -53,7 +53,7 @@ const DISCOVERY_TIMEOUT_MS = 10_000;
 const MAXIMUM_RESPONSE_BYTES = 1024 * 1024;
 const MAXIMUM_DISCOVERY_PAGES = 100;
 const MAXIMUM_DISCOVERED_MODELS = 10_000;
-const CATALOG_PAGE_PARAMETERS = new Set(["after_id", "cursor", "page", "page_token", "pageToken"]);
+const CATALOG_PAGE_PARAMETERS = new Set(["after_id", "before_id", "cursor", "page", "page_token", "pageToken"]);
 
 export function deriveProviderModelsUrl(baseUrl: string, api?: string): string {
   const url = new URL(baseUrl);
@@ -262,7 +262,7 @@ export async function fetchProviderModelCatalog(
       break;
     }
     const list = modelList(page.value);
-    const invalidAnthropicPage = spec.api === "anthropic-messages" && current.searchParams.has("after_id")
+    const invalidAnthropicPage = spec.api === "anthropic-messages" && (current.searchParams.has("after_id") || current.searchParams.has("before_id"))
       && (!isRecord(page.value) || !Array.isArray(page.value["data"]) || typeof page.value["has_more"] !== "boolean");
     if (list === undefined || invalidAnthropicPage) {
       if (count === 1) throw new ProviderModelDiscoveryError("invalid_response");
@@ -335,9 +335,11 @@ function nextCatalogPage(value: unknown, linkHeader: string, endpoint: URL, curr
         next.searchParams.set(param, token);
         return next;
       }
-      if (scope["has_more"] === true && validIdentity(scope["last_id"])) {
+      const reverse = current.searchParams.has("before_id");
+      const cursor = scope[reverse ? "first_id" : "last_id"];
+      if (scope["has_more"] === true && validIdentity(cursor)) {
         const next = new URL(endpoint);
-        next.searchParams.set("after_id", scope["last_id"]);
+        next.searchParams.set(reverse ? "before_id" : "after_id", cursor);
         return next;
       }
     }
