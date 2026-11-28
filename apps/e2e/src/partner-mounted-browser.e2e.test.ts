@@ -301,7 +301,7 @@ describe("mounted Partner collaboration product chain", () => {
     } finally { release(); }
   });
 
-  mountedIt("previews the replacement group invitation before joining it on the other node", { timeout: 120_000 }, async () => {
+  mountedIt("joins the previewed replacement group on the other node and opens it over a slow connection", { timeout: 120_000 }, async () => {
     fixture = await RealPiSystemFixture.start({ webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true, taskSharing: true });
     const host = await RealPiSystemFixture.start({ taskSharing: true });
     let release!: () => void;
@@ -344,11 +344,21 @@ describe("mounted Partner collaboration product chain", () => {
         .filter(actor => actor.kind === "human" && actor.state === "joined").map(actor => actor.name);
       expect(await members(first.room.id)).toEqual(["Host"]);
       expect(await members(second.room.id)).toEqual(["Host"]);
+      let reads = 0, readsBeforeFirstReply = 0;
+      await page.route("**/joko.v1.PartnerNetworkService/GetPartnerNetwork", async route => {
+        if (++reads !== 1) { await route.continue(); return; }
+        const response = await route.fetch();
+        // Keep the actual first snapshot in flight across two normal polling ticks.
+        await new Promise(resolve => setTimeout(resolve, 4_500));
+        readsBeforeFirstReply = reads;
+        await route.fulfill({ response });
+      });
       const [accepted] = await Promise.all([page.waitForResponse(response => response.url().endsWith("/JoinPartnerNetwork")),
         dialog.getByRole("button", { name: "Accept and join" }).click()]);
       const joined = required(fromBinary(JoinPartnerNetworkResponseSchema, await accepted.body()).room, "joined group");
       expect(joined.id).toBe(second.room.id);
       await page.locator(".partner-group-header h1").filter({ hasText: second.room.name }).waitFor();
+      await expect.poll(() => readsBeforeFirstReply, { timeout: 15_000 }).toBe(1);
       expect(new URL(page.url()).hash).toBe(`#/partners/groups/${encodeURIComponent(`network:${joined.joinId}:${joined.id}`)}`);
       expect(await members(first.room.id)).toEqual(["Host"]);
       expect((await members(second.room.id)).sort()).toEqual(["Host", "Visiting member"]);

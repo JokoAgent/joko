@@ -30,7 +30,8 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
   const pendingPlans = useRef(new Map<string, contract.PlanPartnerNetworkRequest>());
   const trackedMentions = useRef<contract.NetworkTrackedMention[]>([]);
   const mentionSelection = useRef<{ start: number; end: number } | undefined>(undefined);
-  const lifetime = useRef(new AbortController()), apiRef = useRef(api), following = useRef(true), list = useRef<FlatList<contract.PartnerNetworkMessage>>(null), request = useRef<{ body: string; id: string } | undefined>(undefined), lastRead = useRef(0n), pages = useRef<bigint[]>([]), readVersion = useRef(0), draftVersion = useRef(0);
+  const lifetime = useRef(new AbortController()), apiRef = useRef(api), following = useRef(true), list = useRef<FlatList<contract.PartnerNetworkMessage>>(null), request = useRef<{ body: string; id: string } | undefined>(undefined), lastRead = useRef(0n), pages = useRef<bigint[]>([]), draftVersion = useRef(0);
+  const activeRead = useRef<{ signal: AbortSignal } | undefined>(undefined);
   const roomSignal = lifetime.current.signal;
   const mediaRequest = useRef<AbortController | undefined>(undefined);
   useLayoutEffect(() => {
@@ -71,7 +72,7 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
   const selectRoom = (next?: contract.PartnerNetworkRoom) => {
     lifetime.current.abort();
     lifetime.current = new AbortController();
-    readVersion.current += 1;
+    activeRead.current = undefined;
     pages.current = [];
     lastRead.current = 0n;
     following.current = true;
@@ -80,15 +81,16 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
   };
   const load = async (older = false, signal = roomSignal) => {
     const current = apiRef.current; if (!current || signal.aborted || roomSignal.aborted) return;
-    const version = ++readVersion.current;
+    const flight = { signal };
+    activeRead.current = flight;
     try {
-      if (!selected) { const response = await current.listPartnerNetwork({}, { signal }); if (!signal.aborted && version === readVersion.current) { setRooms(response.rooms); setError(undefined); } return; }
+      if (!selected) { const response = await current.listPartnerNetwork({}, { signal }); if (!signal.aborted && activeRead.current === flight) { setRooms(response.rooms); setError(undefined); } return; }
       const key = { roomId: selected.id, joinId: selected.joinId }, before = older ? messages[0]?.sequence : undefined;
       const response = await current.getPartnerNetwork({ ...key, ...(before ? { beforeSequence: before } : {}) }, { signal });
-      if (signal.aborted || version !== readVersion.current || !response.snapshot?.room) return;
+      if (signal.aborted || activeRead.current !== flight || !response.snapshot?.room) return;
       if (before && !pages.current.includes(before)) pages.current.push(before);
       const prior = older ? [] : await Promise.all(pages.current.map(beforeSequence => current.getPartnerNetwork({ ...key, beforeSequence }, { signal })));
-      if (signal.aborted || version !== readVersion.current) return;
+      if (signal.aborted || activeRead.current !== flight) return;
       const rows = [...response.snapshot.messages, ...prior.flatMap(page => page.snapshot?.messages ?? [])];
       const plans = new Map<string, contract.PartnerNetworkPlan>();
       for (const plan of [...older ? snapshot?.plans ?? [] : [], ...response.snapshot.plans, ...prior.flatMap(page => page.snapshot?.plans ?? [])]) {
@@ -98,8 +100,9 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
       setSnapshot(create(contract.PartnerNetworkSnapshotSchema, { ...response.snapshot, plans: [...plans.values()], hasMore: prior.at(-1)?.snapshot?.hasMore ?? response.snapshot.hasMore }));
       setMessages(previous => [...new Map([...older ? previous : [], ...rows].map(row => [row.id, row])).values()].sort((a, b) => a.sequence < b.sequence ? -1 : 1));
       setError(undefined); await journal?.displayed(new Set(rows.map(row => row.id)), key);
-      if (!signal.aborted && !roomSignal.aborted && version === readVersion.current) setRetained(journal?.list() ?? []);
-    } catch (reason) { if (!signal.aborted && version === readVersion.current) { setError(failure(reason)); if (reason instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(reason.code)) { setMessages([]); setSnapshot(undefined); } } }
+      if (!signal.aborted && !roomSignal.aborted && activeRead.current === flight) setRetained(journal?.list() ?? []);
+    } catch (reason) { if (!signal.aborted && activeRead.current === flight) { setError(failure(reason)); if (reason instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(reason.code)) { setMessages([]); setSnapshot(undefined); } } }
+    finally { if (activeRead.current === flight) activeRead.current = undefined; }
   };
   useEffect(() => { let active = true; setJournalReady(false); void journal?.initialize().then(entries => { if (active) { setRetained(entries); setJournalReady(true); } }).catch(() => { if (active) setError(m.unavailable); });
     return () => { active = false; }; }, [journal]);
@@ -107,7 +110,9 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
   useEffect(() => { if (!members || !foreground || !directory) return; const scope = new AbortController();
     void directory.list(scope.signal).then(result => { if (!scope.signal.aborted) setOwned(result.partners); }).catch(() => { if (!scope.signal.aborted) setOwned([]); });
     return () => scope.abort(); }, [members, foreground, directory?.ownerKey]);
-  useEffect(() => { if (!foreground || !api) return; const scope = new AbortController(); const refresh = () => { void load(false, scope.signal); }; refresh(); const timer = setInterval(refresh, selected ? 2_000 : 5_000);
+  useEffect(() => { if (!foreground || !api) return; const scope = new AbortController();
+    const refresh = () => { if (!activeRead.current || activeRead.current.signal.aborted) void load(false, scope.signal); };
+    refresh(); const timer = setInterval(refresh, selected ? 2_000 : 5_000);
     return () => { scope.abort(); clearInterval(timer); }; }, [api?.ownerKey, roomSignal, foreground]);
   const action = async (type: string, actorId = "", value = "") => {
     if (!api || !target || !room || busy || roomSignal.aborted) return; setBusy(true);

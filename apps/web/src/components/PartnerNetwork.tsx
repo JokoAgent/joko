@@ -187,36 +187,42 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
       if (!lifetime.current.signal.aborted) { planAttempt.current = undefined; await read(); }
     } catch (reason) { if (!lifetime.current.signal.aborted) { if (wire.partnerMutationWasRejected(reason)) planAttempt.current = undefined; setError(errorText(reason, m)); } } finally { if (!lifetime.current.signal.aborted) setBusy(false); }
   };
-  const readVersion = useRef(0), lastRead = useRef(0n);
+  const activeRead = useRef<{ signal: AbortSignal } | undefined>(undefined), lastRead = useRef(0n);
   const [dismissedThreads, setDismissedThreads] = useState(0n), [threadList, setThreadList] = useState(false);
   const followAttempt = useRef<{ id: string; following: boolean; through: bigint } | undefined>(undefined);
   const following = useRef(!focusId), olderAnchor = useRef<{ top: number; height: number } | undefined>(undefined), openedRead = useRef<bigint | undefined>(undefined);
   const loadedBefore = useRef<bigint[]>([]);
   const read = async (older = false, signal = lifetime.current.signal) => {
-    const requestVersion = ++readVersion.current;
+    const flight = { signal };
+    activeRead.current = flight;
     try {
       const beforeSequence = older ? (thread ? messages.find(message => message.threadRootId === thread)?.sequence : messages[0]?.sequence) : undefined;
       if (older && list.current) { following.current = false; olderAnchor.current = { top: list.current.scrollTop, height: list.current.scrollHeight }; }
       const result = await api.getPartnerNetwork({ ...target, threadRootId: thread, ...(beforeSequence ? { beforeSequence } : {}) }, { signal });
-      if (signal.aborted || requestVersion !== readVersion.current || !result.snapshot?.room) return;
+      if (signal.aborted || activeRead.current !== flight || !result.snapshot?.room) return;
       if (openedRead.current === undefined) openedRead.current = result.snapshot.threadReadSequence;
       if (beforeSequence && !loadedBefore.current.includes(beforeSequence)) loadedBefore.current.push(beforeSequence);
       const pages = older ? [] : await Promise.all(loadedBefore.current.map(before => api.getPartnerNetwork({ ...target, threadRootId: thread, beforeSequence: before }, { signal })));
-      if (signal.aborted || requestVersion !== readVersion.current) return;
+      if (signal.aborted || activeRead.current !== flight) return;
       const readMessages = [...result.snapshot.messages, ...pages.flatMap(page => page.snapshot?.messages ?? [])];
       const hasMore = pages.at(-1)?.snapshot?.hasMore ?? result.snapshot.hasMore;
       const plans = [...new Map([...older ? snapshot?.plans ?? [] : [], ...result.snapshot.plans, ...pages.flatMap(page => page.snapshot?.plans ?? [])].map(plan => [plan.id, plan])).values()];
       setSnapshot(create(wire.PartnerNetworkSnapshotSchema, { ...result.snapshot, hasMore, plans }));
       setMessages(previous => [...new Map([...older ? previous : [], ...readMessages].map(message => [message.id, message])).values()].sort((a, b) => a.sequence < b.sequence ? -1 : 1)); setError(undefined);
-      const ids = new Set(readMessages.map(message => message.id)); await journal.displayed(ids); if (signal.aborted) return;
+      const ids = new Set(readMessages.map(message => message.id)); await journal.displayed(ids); if (signal.aborted || activeRead.current !== flight) return;
       setPending(previous => previous.filter(item => (!item.messageId || !ids.has(item.messageId)) &&
         (item.status !== "failed" || journal.has(item.request.operationId))));
-    } catch (reason) { if (!signal.aborted && requestVersion === readVersion.current) { setError(errorText(reason, m)); if (reason instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(reason.code)) { setMessages([]); setSnapshot(undefined); } } }
+    } catch (reason) { if (!signal.aborted && activeRead.current === flight) { setError(errorText(reason, m)); if (reason instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(reason.code)) { setMessages([]); setSnapshot(undefined); } } }
+    finally { if (activeRead.current === flight) activeRead.current = undefined; }
   };
   useEffect(() => { const signal = lifetime.current.signal; void controller.listPartners(undefined, signal).then(result => { if (!signal.aborted) setPartners([...result.partners]); }).catch(() => {});
     void journal.initialize().then(entries => { if (!signal.aborted) { setPending(entries.map(entry => ({ ...entry, status: "failed" }))); setJournalReady(true); } }).catch(() => { if (!signal.aborted) setError(m.unavailable); });
     return () => lifetime.current.abort(); }, []);
-  useEffect(() => { loadedBefore.current = []; setMessages([]); setSnapshot(undefined); const scope = new AbortController(); const update = () => { if (document.visibilityState !== "hidden") void read(false, scope.signal); }; update(); const timer = setInterval(update, 2_000); document.addEventListener("visibilitychange", update);
+  useEffect(() => { loadedBefore.current = []; setMessages([]); setSnapshot(undefined); const scope = new AbortController();
+    const update = () => {
+      if (document.visibilityState !== "hidden" && (!activeRead.current || activeRead.current.signal.aborted)) void read(false, scope.signal);
+    };
+    update(); const timer = setInterval(update, 2_000); document.addEventListener("visibilitychange", update);
     return () => { scope.abort(); clearInterval(timer); document.removeEventListener("visibilitychange", update); }; }, [thread]);
   const markVisible = () => {
     const element = list.current, through = messages.at(-1)?.sequence;
