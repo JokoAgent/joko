@@ -54,18 +54,26 @@ export async function readImportFile(root: string, file: string, budget?: Import
   if (!(await fs.lstat(realFile)).isFile()) throw new AgentImportError("SOURCE_NOT_REGULAR_FILE");
   const handle = await fs.open(realFile, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
-    const info = await handle.stat();
+    const info = await handle.stat({ bigint: true });
     if (!info.isFile()) throw new AgentImportError("SOURCE_NOT_REGULAR_FILE");
     if (info.size > MAX_FILE_BYTES) throw new AgentImportError("SOURCE_FILE_TOO_LARGE");
-    budget?.reserveFile(info.size); budget?.reserve(Buffer.byteLength(path.relative(root, file)));
-    const bytes = Buffer.alloc(Math.min(info.size + 1, MAX_FILE_BYTES + 1)); let size = 0;
+    const expectedSize = Number(info.size);
+    budget?.reserveFile(expectedSize); budget?.reserve(Buffer.byteLength(path.relative(root, file)));
+    const bytes = Buffer.alloc(expectedSize + 1); let size = 0;
     while (size < bytes.length) {
       const read = await handle.read(bytes, size, bytes.length - size, size);
       if (!read.bytesRead) break;
       size += read.bytesRead;
     }
-    if (size > info.size) throw new AgentImportError("SOURCE_CHANGED");
-    return { name: path.relative(root, file).split(path.sep).join("/"), bytes: bytes.subarray(0, size), executable: (info.mode & 0o111) !== 0 };
+    const current = await fs.stat(file, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
+      throw error;
+    });
+    if (size !== expectedSize || !current || current.dev !== info.dev || current.ino !== info.ino ||
+      current.size !== info.size || current.mtimeNs !== info.mtimeNs || current.ctimeNs !== info.ctimeNs) {
+      throw new AgentImportError("SOURCE_CHANGED");
+    }
+    return { name: path.relative(root, file).split(path.sep).join("/"), bytes: bytes.subarray(0, size), executable: (info.mode & 0o111n) !== 0n };
   } finally { await handle.close(); }
 }
 
