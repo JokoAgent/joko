@@ -21,9 +21,13 @@ export function isValidMobileScheduleTimeZone(timeZone: string): boolean {
   }
 }
 
-export function mobileScheduleEpochFromLocalDateTime(value: string, timeZone: string): number | undefined {
+export function mobileScheduleEpochFromLocalDateTime(value: string, timeZone: string, preferredEpoch?: number): number | undefined {
   const intended = parseLocalDateTime(value);
   if (intended === undefined || !isValidMobileScheduleTimeZone(timeZone)) return undefined;
+  if (preferredEpoch !== undefined && Number.isSafeInteger(preferredEpoch) && Number.isFinite(new Date(preferredEpoch).getTime())) {
+    const includesSeconds = value.trim().length > "YYYY-MM-DDTHH:mm".length;
+    if (sameParts(dateTimeParts(preferredEpoch, timeZone), intended, includesSeconds)) return preferredEpoch;
+  }
   const wallClockAsUtc = partsAsUtc(intended);
   let candidate = wallClockAsUtc;
   for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -96,9 +100,9 @@ function partsAsUtc(parts: DateTimeParts): number {
   return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
 }
 
-function sameParts(left: DateTimeParts, right: DateTimeParts): boolean {
+function sameParts(left: DateTimeParts, right: DateTimeParts, compareSeconds = true): boolean {
   return left.year === right.year && left.month === right.month && left.day === right.day
-    && left.hour === right.hour && left.minute === right.minute && left.second === right.second;
+    && left.hour === right.hour && left.minute === right.minute && (!compareSeconds || left.second === right.second);
 }
 
 function pad(value: number, width = 2): string {

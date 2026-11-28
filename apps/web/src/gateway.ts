@@ -4532,9 +4532,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (draft.scriptTimeoutMs !== undefined && (!Number.isSafeInteger(draft.scriptTimeoutMs) || draft.scriptTimeoutMs <= 0)) {
       throw new GatewayError("Script timeout must be a positive whole number of milliseconds.");
     }
+    const savedDeadline = draft.original && draft.original.id === scheduleId && draft.original.timezone === draft.timezone.trim()
+      ? draft.original.expireAt : undefined;
     const expireAt = draft.expireAtExpression.trim().length === 0
       ? undefined
-      : scheduleEpochFromLocalDateTime(draft.expireAtExpression, draft.timezone);
+      : scheduleEpochFromLocalDateTime(draft.expireAtExpression, draft.timezone, savedDeadline);
     if (draft.expireAtExpression.trim().length > 0 && expireAt === undefined) {
       throw new GatewayError("Enter a valid expiration time in the selected IANA timezone.");
     }

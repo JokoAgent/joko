@@ -438,9 +438,7 @@ export function buildMobileAutomationScheduleInput(
   } else if (draft.recurrence === "once") {
     const savedEpoch = existing?.recurrence === "once" && existing.timeZone === timeZone
       ? Date.parse(existing.recurrenceExpression) : undefined;
-    const unchanged = savedEpoch !== undefined && Number.isFinite(savedEpoch)
-      && draft.expression.trim() === mobileScheduleLocalDateTimeFromEpoch(savedEpoch, timeZone);
-    const epoch = unchanged ? savedEpoch : mobileScheduleEpochFromLocalDateTime(draft.expression, timeZone);
+    const epoch = mobileScheduleEpochFromLocalDateTime(draft.expression, timeZone, savedEpoch);
     if (epoch === undefined) throw new Error("Enter a valid one-shot time in the selected time zone.");
     if (draft.enabled && epoch <= now) throw new Error("An enabled one-shot Automation must run in the future.");
     recurrence = { kind: { case: "oneShot", value: { triggerAt: timestamp(epoch) } } } as ScheduleInput["recurrence"];
@@ -561,7 +559,7 @@ export function buildMobileAutomationScheduleInput(
   }
 
   const expireAt = draft.expireAtExpression.trim() === ""
-    ? undefined : mobileScheduleEpochFromLocalDateTime(draft.expireAtExpression, timeZone);
+    ? undefined : mobileScheduleEpochFromLocalDateTime(draft.expireAtExpression, timeZone, existing?.timeZone === timeZone ? existing.expireAt : undefined);
   if (draft.expireAtExpression.trim() !== "" && expireAt === undefined) {
     throw new Error("Enter a valid expiration time in the selected IANA time zone.");
   }
