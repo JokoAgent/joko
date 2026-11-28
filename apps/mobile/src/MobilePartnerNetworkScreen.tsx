@@ -30,9 +30,9 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
   const pendingPlans = useRef(new Map<string, contract.PlanPartnerNetworkRequest>());
   const trackedMentions = useRef<contract.NetworkTrackedMention[]>([]);
   const mentionSelection = useRef<{ start: number; end: number } | undefined>(undefined);
-  const lifetime = useRef(new AbortController()), apiRef = useRef(api), following = useRef(true), list = useRef<FlatList<contract.PartnerNetworkMessage>>(null), request = useRef<{ body: string; id: string } | undefined>(undefined), lastRead = useRef(0n), pages = useRef<bigint[]>([]), readVersion = useRef(0), draftRef = useRef(draft);
+  const lifetime = useRef(new AbortController()), apiRef = useRef(api), following = useRef(true), list = useRef<FlatList<contract.PartnerNetworkMessage>>(null), request = useRef<{ body: string; id: string } | undefined>(undefined), lastRead = useRef(0n), pages = useRef<bigint[]>([]), readVersion = useRef(0), draftVersion = useRef(0);
   const roomSignal = lifetime.current.signal;
-  apiRef.current = api; draftRef.current = draft;
+  apiRef.current = api;
   const journal = useMemo(() => api ? new contract.PartnerNetworkSendJournal(storage, api.ownerKey.replace(/:\d+$/u, "")) : undefined, [api?.ownerKey]);
   const room = snapshot?.room ?? selected, self = room?.members.find(actor => actor.id === room.selfId), admin = self?.state === "joined" && ["owner", "admin"].includes(self.role), canSend = self?.state === "joined" && room?.state === "active" && !!snapshot;
   const target = room ? { roomId: room.id, joinId: room.joinId } : undefined;
@@ -45,16 +45,20 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
     const restored = draftKey && mobileNetworkDrafts.get(draftKey); activeDraftKey.current = draftKey; setDraft(restored ? restored.text : ""); setMentions(restored ? restored.mentions : []); trackedMentions.current = restored ? [...restored.tracked] : []; mentionSelection.current = undefined; request.current = undefined;
     while (mobileNetworkDrafts.size > 100) mobileNetworkDrafts.delete(mobileNetworkDrafts.keys().next().value!); }, [draftKey]);
   useEffect(() => () => { if (activeDraftKey.current) mobileNetworkDrafts.set(activeDraftKey.current, activeDraft.current); }, []);
+  const updateText = (value: string) => {
+    draftVersion.current++;
+    setDraft(value); setMentions(contract.resolveNetworkMentions(value, { ...mentionInput, tracked: trackedMentions.current }).actorIds);
+  };
   const editDraft = (value: string) => {
     const selection = mentionSelection.current; mentionSelection.current = undefined;
     trackedMentions.current = contract.retainNetworkTrackedMentions(draft, value, { ...mentionInput, tracked: trackedMentions.current,
       editStart: selection?.start, editEnd: selection?.end });
-    setDraft(value); setMentions(contract.resolveNetworkMentions(value, { ...mentionInput, tracked: trackedMentions.current }).actorIds);
+    updateText(value);
   };
   const pickMention = (actorId?: string, audience = m.everyone) => { const label = actorId ? mentionMembers.find(actor => actor.actorId === actorId)?.name : audience; if (!label) return;
     const prefix = draft && !/\s$/u.test(draft) ? `${draft} ` : draft, inserted = `${prefix}@${label} `;
     if (actorId) trackedMentions.current.push({ actorId, label, start: prefix.length }); mentionSelection.current = undefined;
-    setDraft(inserted); setMentions(contract.resolveNetworkMentions(inserted, { ...mentionInput, tracked: trackedMentions.current }).actorIds); };
+    updateText(inserted); };
   const failure = (reason: unknown) => reason instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(reason.code) ? m.denied : m.unavailable;
   const selectRoom = (next?: contract.PartnerNetworkRoom) => {
     lifetime.current.abort();
@@ -116,9 +120,11 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
   const send = async (previous?: contract.PartnerNetworkOutboxEntry) => {
     if (!api || !target || !canSend || !journal || !journalReady || busy || roomSignal.aborted || !previous && !draft.trim()) return;
     const resolved = contract.resolveNetworkMentions(draft, mentionInput), body = JSON.stringify([target, draft, resolved]); if (request.current?.body !== body) request.current = { body, id: randomUUID() };
-    const retainedRequest = retained.find(entry => !entry.messageId && entry.request.roomId === target.roomId && entry.request.joinId === target.joinId
-      && entry.request.text === draft && entry.request.mentionAll === resolved.all && entry.request.mentionAllPartners === resolved.allPartners
-      && JSON.stringify(entry.request.mentions) === JSON.stringify(resolved.actorIds))?.request;
+    const version = draftVersion.current;
+    const matchesDraft = (input: contract.SendPartnerNetworkRequest) => input.roomId === target.roomId && input.joinId === target.joinId
+      && input.text === draft && input.mentionAll === resolved.all && input.mentionAllPartners === resolved.allPartners
+      && JSON.stringify(input.mentions) === JSON.stringify(resolved.actorIds);
+    const retainedRequest = retained.find(entry => !entry.messageId && matchesDraft(entry.request))?.request;
     if (!previous && !retainedRequest && resolved.allPartners && !room?.allowMentionAllPartners) { setError(m.partnerBroadcastDisabled); return; }
     const input = previous?.request ?? retainedRequest ?? create(contract.SendPartnerNetworkRequestSchema, { ...target, operationId: request.current.id, text: draft,
       mentions: resolved.actorIds, mentionAll: resolved.all, mentionAllPartners: resolved.allPartners });
@@ -126,7 +132,9 @@ export function MobilePartnerNetworkScreen({ api, directory, colors, locale, for
     try { await journal.prepare(input, previous?.createdAt); roomSignal.throwIfAborted(); setRetained(journal.list());
       const result = await api.sendPartnerNetwork(input, { signal: roomSignal }); roomSignal.throwIfAborted(); if (!result.message) throw new Error();
       await journal.acknowledge(input.operationId, result.message.id); roomSignal.throwIfAborted();
-      if (draftRef.current === input.text) { setDraft(""); setMentions([]); trackedMentions.current = []; request.current = undefined; } await load();
+      if (request.current?.id === input.operationId) request.current = undefined;
+      if (draftVersion.current === version && matchesDraft(input)) { setDraft(""); setMentions([]); trackedMentions.current = []; }
+      await load();
     } catch (reason) { if (!roomSignal.aborted) { setRetained(journal.list()); setError(failure(reason)); } } finally { if (!roomSignal.aborted) setBusy(false); }
   };
   const media = async (attachment: contract.PartnerNetworkAttachment) => {
