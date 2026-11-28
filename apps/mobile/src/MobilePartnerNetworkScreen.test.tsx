@@ -97,6 +97,25 @@ it.each([false, true])("shows the inactive companion audience switch only when t
   expect(document.querySelector('[role="dialog"]')?.textContent?.includes("Allow mentioning all companions")).toBe(supported);
   expect(f.manage).not.toHaveBeenCalled();
 });
+it("keeps a late send in its original room when the user opens a second conversation", async () => {
+  const f = fixture();
+  const other = create(contract.PartnerNetworkRoomSchema, { ...f.room, id: "second-room", name: "Second room" });
+  let finish!: (response: contract.SendPartnerNetworkResponse) => void;
+  f.send.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await mount(f, { ...f.api, ownerKey: "two-rooms:1",
+    listPartnerNetwork: async () => create(contract.ListPartnerNetworkResponseSchema, { rooms: [f.room, other] }),
+    getPartnerNetwork: async request => create(contract.GetPartnerNetworkResponseSchema, {
+      snapshot: { room: request.roomId === other.id ? other : f.room }
+    }) });
+  await click("Shared room"); await fill("Same text"); await click("Send");
+  expect(f.send.mock.calls[0]?.[0].roomId).toBe(f.room.id);
+  await click("Back to group"); await click("Second room"); await fill("Same text");
+  await act(async () => { finish(create(contract.SendPartnerNetworkResponseSchema, { message: { id: "first-message" } })); await pause(); });
+  expect(document.querySelector<HTMLInputElement>('[aria-label="Message"]')?.value).toBe("Same text");
+  expect(document.body.textContent).toContain("Second room");
+  expect(document.body.textContent).not.toContain("Shared room");
+  expect(f.send).toHaveBeenCalledTimes(1);
+});
 it("opens files using only a current short-lived download URL and never hands a membership bearer to the system", async () => {
   const f = fixture(); f.rows.push(create(contract.PartnerNetworkMessageSchema, { id: "file-message", authorId: "partner", text: "A document", sequence: 1n, attachments: [{ id: "file", name: "report.txt", mediaType: "text/plain", sizeBytes: 12n }] }));
   await mount(f); await click("Shared room"); await click("report.txt"); expect(f.media).toHaveBeenCalledWith(expect.objectContaining({ action: "authorize", mediaId: "file" }), expect.anything());

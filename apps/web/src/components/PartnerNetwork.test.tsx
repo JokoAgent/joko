@@ -139,6 +139,27 @@ describe("Shared conversation UI receipts", () => {
     await act(async () => { first.root.unmount(); }); roots.splice(roots.indexOf(first.root), 1); first.element.remove();
     const next = await mount(page()); expect(next.element.querySelector("textarea")!.value).toBe("Main draft @Nova"); expect(f.api.sendPartnerNetwork).not.toHaveBeenCalled();
   });
+  it("recovers both pending sends after using the main room and its thread together", async () => {
+    const f = setup();
+    f.rows.push(create(wire.PartnerNetworkMessageSchema, { id: "topic", text: "Topic", sequence: 1n }));
+    f.api.sendPartnerNetwork.mockRejectedValue(new ConnectError("Reply lost", Code.Unavailable));
+    const page = () => <PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />;
+    const view = await mount(page());
+    const openThread = async (parent: Element) => { await act(async () => { button("Create thread", parent).click(); await settle(); }); };
+    await openThread(view.element);
+    for (const [selector, text] of [[".partner-network-main", "Main pending"], [".partner-network-thread", "Reply pending"]] as const) {
+      const pane = view.element.querySelector(selector)!;
+      await fill(pane.querySelector("textarea")!, text);
+      await act(async () => { button("Send", pane).click(); await settle(); });
+    }
+    expect(f.api.sendPartnerNetwork.mock.calls.map(([request]) => request.threadRootId)).toEqual(["", "topic"]);
+    await act(async () => view.root.unmount()); roots.splice(roots.indexOf(view.root), 1); view.element.remove();
+    const reopened = await mount(page());
+    await openThread(reopened.element);
+    expect(reopened.element.querySelector(".partner-network-main")?.textContent).toContain("Main pending");
+    expect(reopened.element.querySelector(".partner-network-thread")?.textContent).toContain("Reply pending");
+    expect(f.api.sendPartnerNetwork).toHaveBeenCalledTimes(2);
+  });
   it("reuses unknown send IDs when editing the unchanged mention-all and division request", async () => {
     const f = setup(); f.api.sendPartnerNetwork.mockRejectedValueOnce(new ConnectError("lost", Code.Unavailable)); const view = await mount(<PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />);
     await fill(view.element.querySelector("textarea")!, "@Everyone arrange this"); await act(async () => { button(wire.partnerGroupMessages("en").divide, view.element).click(); await settle(); button("Send", view.element).click(); await settle(); });

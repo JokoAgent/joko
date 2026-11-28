@@ -69,6 +69,31 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     } finally { editor.gateway.disconnect(); }
   });
 
+  it("preserves the original expiration through a Web rename during a repeated hour", async () => {
+    const host = fixture = await OrchestratorE2eFixture.start();
+    const owner = await host.pair("Schedule deadline editor");
+    const deadline = { seconds: BigInt(Date.parse("2027-11-07T06:30:45Z") / 1000), nanos: 123_000_000 };
+    const request = createManualScheduleMutation({ backendId: host.adapter().id, targetId: host.targetId(),
+      text: "Check the project", execution: { expireAt: deadline } });
+    if (request.payload.case !== "createSchedule" || !request.payload.value.schedule) throw new Error("Missing schedule input.");
+    request.payload.value.schedule.timeZone = "America/New_York";
+    const id = scheduleIdFrom(await submit(owner.clients.operation, owner.connectionId, request));
+    const editor = await openWebScheduleEditor(host, owner);
+    const readDeadline = async () => (await owner.clients.scheduler.getSchedule({ scheduleId: id })).schedule?.execution?.expireAt;
+    try {
+      const draft = editor.draft(id);
+      expect(draft.expireAtExpression).toBe("2027-11-07T01:30");
+      await editor.gateway.saveSchedule(id, { ...draft, name: "Renamed schedule" });
+      expect(await readDeadline()).toMatchObject(deadline);
+      await editor.gateway.refresh();
+      await editor.gateway.saveSchedule(id, { ...editor.draft(id), timezone: "UTC" });
+      expect(await readDeadline()).toMatchObject({ seconds: BigInt(Date.parse("2027-11-07T01:30:00Z") / 1000), nanos: 0 });
+      await editor.gateway.refresh();
+      await editor.gateway.saveSchedule(id, { ...editor.draft(id), expireAtExpression: "" });
+      expect(await readDeadline()).toBeUndefined();
+    } finally { editor.gateway.disconnect(); }
+  });
+
   it("round trips the complete v1 scheduled input through a Web rename", async () => {
     const host = fixture = await OrchestratorE2eFixture.start();
     const owner = await host.pair("Schedule editor");

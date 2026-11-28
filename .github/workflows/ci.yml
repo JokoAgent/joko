@@ -85,6 +85,10 @@ jobs:
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
         run: pnpm --filter @joko/orchestrator exec vitest run --reporter=verbose src/application.test.ts -t 'refreshes a granted workbench project' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/workbench-login.log"
+      - name: Check conversation receipts, room changes and mobile schedule edits
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: pnpm --filter @joko/web --filter @joko/mobile -r --no-bail exec vitest run --reporter=verbose partner-network-outbox.test.ts PartnerNetwork.test.tsx MobilePartnerNetworkScreen.test.tsx mobile-automation-authoring.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/conversation-and-schedule.log"
       - name: Check Partner import files while a source editor is saving
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash

@@ -53,7 +53,7 @@ describe("mobile Automation authoring", () => {
     const owner = authoringOwner();
     const existing: MobileAutomationSchedule = { scheduleId: "script", displayName: "Saved script", state: "enabled", source: "dialogue",
       backendId: "backend", targetId: "target", sessionMode: "bound", sessionId: "session", recurrence: "manual", recurrenceLabel: "Manual", recurrenceExpression: "",
-      timeZone: "UTC", inputText: "", executionMode: "script", script: { command: "node task.mjs", dispatchSessions: true }, permissionMode: "ask", planMode: false,
+      timeZone: "America/New_York", expireAt: Date.parse("2027-11-07T06:30:45.123Z"), inputText: "", executionMode: "script", script: { command: "node task.mjs", dispatchSessions: true }, permissionMode: "ask", planMode: false,
       useWorktree: false, refreshWorktreeRemote: false, extraDirectoryIds: [], silentWhenIdle: false, notifyDesktop: true, overlapPolicy: "queue", misfirePolicy: "runOnce",
       unreadRunCount: 0, recentRuns: [], revision: { value: 2n, etag: "script-r2" }, generation: 1n };
     const draft = createMobileAutomationDraft(owner, existing);
@@ -61,6 +61,13 @@ describe("mobile Automation authoring", () => {
     const saved = buildMobileAutomationScheduleInput(owner, { ...draft, name: "Renamed script" }, existing, undefined).schedule;
     expect(saved).toMatchObject({ displayName: "Renamed script", sessionMode: ScheduleSessionMode.BOUND, sessionId: "session" });
     expect(saved.execution?.model).toBeUndefined();
+    expect(draft.expireAtExpression).toBe("2027-11-07T01:30");
+    expect(saved.execution?.expireAt).toMatchObject({ seconds: BigInt(Date.parse("2027-11-07T06:30:45Z") / 1000), nanos: 123_000_000 });
+    const edit = (expireAtExpression: string, timeZone = draft.timeZone) =>
+      buildMobileAutomationScheduleInput(owner, { ...draft, expireAtExpression, timeZone }, existing, undefined).schedule.execution?.expireAt;
+    expect(edit("2027-11-07T01:30", "UTC")).toMatchObject({ seconds: BigInt(Date.parse("2027-11-07T01:30:00Z") / 1000), nanos: 0 });
+    expect(edit("2027-11-07T03:15")).toMatchObject({ seconds: BigInt(Date.parse("2027-11-07T08:15:00Z") / 1000), nanos: 0 });
+    expect(edit("")).toBeUndefined();
   });
   it("renames the saved task-default one-shot after the original task adopts a paired Backend", () => {
     const owner = authoringOwner();
