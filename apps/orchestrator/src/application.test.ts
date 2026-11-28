@@ -435,7 +435,7 @@ describe("Orchestrator application composition", () => {
       provider: { id: providerId, baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", keyless: true,
         models: [{ id: modelId, contextWindow: 16_384, maxTokens: 1_024 }] } });
     await app.refreshPiGeneration!();
-    const partner = await app.partners!.createPartner({ requestId: "workbench-login", expectedDirectoryRevision: app.partners!.directory().state.revision,
+    const partner = await app.partners!.createPartner({ requestId: randomUUID(), expectedDirectoryRevision: app.partners!.directory().state.revision,
       displayName: "Reviewer", avatar: "orbit", identitySource: "Review the project.", templateId: "general", usesDirectoryDefaults: false,
       capabilities: { modelChain: [{ backendId: "pi", providerId, modelId, fastMode: false }], permissionMode: "ask", planMode: false } });
     const workbench = app.partnerWorkbenches!;
